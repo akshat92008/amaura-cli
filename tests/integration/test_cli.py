@@ -21,6 +21,7 @@ def test_cli_agents():
     assert result.exit_code == 0
     assert "artifact_only" in result.output
     assert "local_cli" in result.output
+    assert "model" in result.output
 
 
 def test_cli_policy():

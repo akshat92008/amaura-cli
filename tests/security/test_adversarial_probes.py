@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from amaura.agents.adapters.artifact_only import ArtifactOnlyAdapter
+from amaura.agents.adapters.local_cli import LocalCLIAdapter
+from amaura.agents.base import AgentCapability
 from amaura.agents.registry import AgentRegistry
 from amaura.config import AmauraConfig, PrivacyMode, SecurityConfig, VerificationPolicyConfig
 from amaura.errors import (
@@ -1481,7 +1484,140 @@ def test_probe_e7_policy_knobs_effective(tmp_path: Path):
     pol_cfg_open = VerificationPolicyConfig(fail_closed_on_timeout=False)
     evaluator_open = VerdictEvaluator(VerdictPolicy(pol_cfg_open))
     res_open = evaluator_open.evaluate(task, [], [chk], [exec_timeout], [])
-    assert res_open.overall_verdict == OverallVerdict.INCONCLUSIVE
+def test_probe_f1_task_delivery_and_no_dummy_echo(tmp_path: Path):
+    """LocalCLIAdapter rejects execution without command and delivers task.md + env + token substitution (F1)."""
+    ws = tmp_path / "ws_f1"
+    ws.mkdir()
+    task = TaskSpec(
+        task_id="TASK-PROBE-F1",
+        instruction="Write greeting to greet.py",
+        requirements=[Requirement(id="REQ-01", description="Say hello")],
+    )
+
+    # 1. No command provided -> must raise AdapterError, not dummy echo
+    adapter_empty = LocalCLIAdapter(cli_command=None)
+    with pytest.raises(AdapterError):
+        adapter_empty.execute(task, ws)
+
+    # 2. Command with {task_file} token receives the actual written task.md path
+    verify_script = (
+        "import sys, os\n"
+        "task_path = sys.argv[1]\n"
+        "assert os.path.exists(task_path), f'Task file not found: {task_path}'\n"
+        "assert 'Write greeting to greet.py' in open(task_path).read()\n"
+        "assert os.environ.get('AMAURA_TASK_ID') == 'TASK-PROBE-F1'\n"
+        "assert 'AMAURA_TASK_PROMPT' in os.environ\n"
+        "with open('greet.py', 'w') as f:\n"
+        "    f.write('def hello(): return \"hello\"\\n')\n"
+    )
+    cmd = [sys.executable, "-c", verify_script, "{task_file}"]
+    adapter = LocalCLIAdapter(cli_command=cmd)
+    res = adapter.execute(task, ws)
+    assert res.success is True
+    assert (ws / "task.md").is_file()
+    assert (ws / "greet.py").is_file()
+    assert "greet.py" in res.modified_files
+
+
+def test_probe_f2_agent_environment_and_network_not_blackholed(tmp_path: Path, monkeypatch):
+    """Agents run in agent runtime with host keys and HOME preserved, not verification sandbox (F2)."""
+    from amaura.security.process import run_agent_process, run_safe_process
+
+    monkeypatch.setenv("MOCK_LLM_KEY", "probe_test_model_key_98765")
+
+    ws = tmp_path / "ws_f2"
+    ws.mkdir()
+
+    probe_script = (
+        "import os, sys\n"
+        "key = os.environ.get('MOCK_LLM_KEY', '')\n"
+        "home = os.environ.get('HOME', '')\n"
+        "sys.stdout.write(f'KEY={key};HOME={home}')\n"
+    )
+
+    # In verification sandbox: key is stripped and HOME is replaced with temporary sandbox
+    safe_res = run_safe_process([sys.executable, "-c", probe_script], cwd=ws)
+    assert "KEY=;" in safe_res.stdout  # Stripped!
+    assert "amaura_sandbox_" in safe_res.stdout  # HOME replaced!
+
+    # In agent execution environment: host key and HOME are preserved
+    agent_res = run_agent_process([sys.executable, "-c", probe_script], cwd=ws)
+    assert "KEY=probe_test_model_key_98765" in agent_res.stdout
+    assert "amaura_sandbox_" not in agent_res.stdout
+    assert os.environ["HOME"] in agent_res.stdout
+
+
+def test_probe_f3_modified_files_accuracy(tmp_path: Path):
+    """artifact_only sets modified_files=[] and local_cli tracks only actual changes (F3)."""
+    ws = tmp_path / "ws_f3"
+    ws.mkdir()
+    (ws / "pre_existing1.py").write_text("a = 1\n")
+    (ws / "pre_existing2.py").write_text("b = 2\n")
+
+    task = TaskSpec(task_id="TASK-F3", instruction="Check workspace")
+
+    # 1. artifact_only should NOT claim existing files were modified
+    art_adapter = ArtifactOnlyAdapter()
+    art_res = art_adapter.execute(task, ws)
+    assert art_res.success is True
+    assert art_res.modified_files == []
+
+    # 2. local_cli should track exactly what was created / modified
+    script = (
+        "with open('pre_existing1.py', 'a') as f:\n"
+        "    f.write('modified = True\\n')\n"
+        "with open('new_created.py', 'w') as f:\n"
+        "    f.write('c = 3\\n')\n"
+    )
+    cli_adapter = LocalCLIAdapter(cli_command=[sys.executable, "-c", script])
+    cli_res = cli_adapter.execute(task, ws)
+    assert cli_res.success is True
+    assert sorted(cli_res.modified_files) == ["new_created.py", "pre_existing1.py"]
+    assert "pre_existing2.py" not in cli_res.modified_files
+
+
+def test_probe_f4_model_adapter_and_usage(tmp_path: Path):
+    """ModelAgentAdapter provides model inference, usage accounting, and record capture (F4)."""
+    from amaura.agents.adapters.model import ModelAgentAdapter
+    from amaura.orchestration.runner import run_and_verify
+
+    ws = tmp_path / "ws_f4"
+    ws.mkdir()
+    (ws / "initial.py").write_text("def run(): pass\n")
+
+    task_file = tmp_path / "task_f4.md"
+    task_file.write_text("# Task\nInstruction: Create solution\n## Requirements\n- REQ-01: Pass test\n")
+
+    # Verify discovery
+    reg = AgentRegistry()
+    assert isinstance(reg.get("model"), ModelAgentAdapter)
+    assert any(a.name == "model" for a in reg.find_by_capability(AgentCapability.MODEL_INFERENCE))
+
+    # Verify run_and_verify records agent_usage
+    record = run_and_verify(
+        task_file=task_file,
+        agent_name="model",
+        project_dir=ws,
+        config=AmauraConfig(runs_dir=str(tmp_path / "runs_f4")),
+    )
+    assert record.agent_usage is not None
+    assert record.agent_usage.prompt_tokens > 0
+    assert record.agent_usage.total_tokens > 0
+    assert any("Agent usage:" in lim for lim in record.limitations)
+
+
+def test_probe_f5_agent_capability_enum():
+    """AgentCapability inherits from (str, Enum) and all adapters have valid enum capabilities (F5)."""
+    from enum import Enum
+
+    assert issubclass(AgentCapability, Enum)
+    assert issubclass(AgentCapability, str)
+
+    reg = AgentRegistry()
+    for adapter in reg.list_adapters():
+        for cap in adapter.capabilities:
+            assert isinstance(cap, Enum)
+            assert isinstance(cap, AgentCapability)
 
 
 

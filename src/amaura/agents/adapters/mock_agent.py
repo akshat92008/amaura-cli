@@ -20,10 +20,25 @@ class MockAgentAdapter(BaseAgentAdapter):
         self.action = action
 
     def execute(self, task: TaskSpec, workspace_dir: Path) -> AgentRunResult:
+        pre_snapshot = {
+            str(p.relative_to(workspace_dir)): p.read_bytes()
+            for p in workspace_dir.rglob("*")
+            if p.is_file()
+        }
         if self.action:
             self.action(workspace_dir)
+        post_snapshot = {
+            str(p.relative_to(workspace_dir)): p.read_bytes()
+            for p in workspace_dir.rglob("*")
+            if p.is_file()
+        }
+        modified = sorted(
+            [rel for rel, b in post_snapshot.items() if rel not in pre_snapshot or pre_snapshot[rel] != b]
+            + [rel for rel in pre_snapshot if rel not in post_snapshot]
+        )
         return AgentRunResult(
             adapter_name=self.name,
             success=True,
+            modified_files=modified,
             output="Mock agent execution completed.",
         )

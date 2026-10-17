@@ -20,6 +20,6 @@ class ArtifactOnlyAdapter(BaseAgentAdapter):
         return AgentRunResult(
             adapter_name=self.name,
             success=True,
-            modified_files=files,
-            output=f"Audited {len(files)} existing workspace files passively.",
+            modified_files=[],  # Passive audit does not modify workspace files (F3)
+            output=f"Audited {len(files)} existing workspace files passively (0 files modified).",
         )

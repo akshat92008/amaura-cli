@@ -425,3 +425,166 @@ os.mkdir = _safe_mkdir
             sandbox_tmp_dir.cleanup()
         except Exception:
             pass
+
+
+def run_agent_process(
+    command: list[str] | str,
+    cwd: Path,
+    env: Optional[dict[str, str]] = None,
+    timeout_seconds: Optional[int] = None,
+    allow_network: bool = True,
+    budget_config: Optional[BudgetConfig] = None,
+    security_config: Optional[SecurityConfig] = None,
+) -> ProcessResult:
+    """Executes an external agent process without the restrictive verification sandbox (F2).
+
+    Preserves the host environment, real HOME directory, API keys (e.g., OPENAI_API_KEY,
+    ANTHROPIC_API_KEY, GEMINI_API_KEY), and allows outbound network connections, while
+    retaining process group lifecycle management, timeout enforcement, output bounding,
+    and secret redaction.
+    """
+    sec = security_config or SecurityConfig()
+    bud = budget_config or BudgetConfig()
+
+    cmd_parts = [command] if isinstance(command, str) else list(command)
+
+    effective_timeout = timeout_seconds if timeout_seconds is not None else bud.default_timeout_seconds
+    effective_timeout = min(effective_timeout, sec.max_timeout_seconds)
+
+    # Agent runs with host environment preserved (keys, HOME, etc.)
+    agent_env = os.environ.copy()
+
+    if not allow_network:
+        agent_env["http_proxy"] = "http://127.0.0.1:0"
+        agent_env["https_proxy"] = "http://127.0.0.1:0"
+        agent_env["all_proxy"] = "http://127.0.0.1:0"
+        agent_env["HTTP_PROXY"] = "http://127.0.0.1:0"
+        agent_env["HTTPS_PROXY"] = "http://127.0.0.1:0"
+        agent_env["ALL_PROXY"] = "http://127.0.0.1:0"
+
+    if env:
+        agent_env.update(env)
+
+    start_t = time.perf_counter()
+    proc: Optional[subprocess.Popen] = None
+    try:
+        proc = subprocess.Popen(
+            cmd_parts,
+            cwd=str(cwd.resolve()),
+            env=agent_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            shell=False,
+            start_new_session=True,  # Process group on POSIX
+        )
+
+        stdout_bytes = bytearray()
+        stderr_bytes = bytearray()
+        limit = bud.max_output_capture_bytes
+        timed_out = False
+        exceeded_size = False
+
+        rlist = [p for p in (proc.stdout, proc.stderr) if p is not None]
+        deadline = start_t + effective_timeout
+
+        while rlist:
+            now = time.perf_counter()
+            remaining = deadline - now
+            if remaining <= 0:
+                timed_out = True
+                break
+
+            readable, _, _ = select.select(rlist, [], [], min(remaining, 0.1))
+            if not readable:
+                if proc.poll() is not None:
+                    for stream_pipe in rlist:
+                        if stream_pipe:
+                            data = stream_pipe.read(65536)
+                            if data:
+                                if stream_pipe is proc.stdout:
+                                    stdout_bytes.extend(data)
+                                else:
+                                    stderr_bytes.extend(data)
+                    break
+                continue
+
+            for stream_pipe in readable:
+                if not stream_pipe:
+                    continue
+                data = stream_pipe.read(65536)
+                if not data:
+                    rlist.remove(stream_pipe)
+                else:
+                    if stream_pipe is proc.stdout:
+                        if len(stdout_bytes) < limit:
+                            stdout_bytes.extend(data[: limit - len(stdout_bytes)])
+                        else:
+                            exceeded_size = True
+                    else:
+                        if len(stderr_bytes) < limit:
+                            stderr_bytes.extend(data[: limit - len(stderr_bytes)])
+                        else:
+                            exceeded_size = True
+
+        if timed_out and proc.poll() is None:
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            else:
+                proc.kill()
+            exit_code = -1
+        else:
+            exit_code = proc.wait()
+
+        duration_ms = int((time.perf_counter() - start_t) * 1000)
+
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
+        stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+        if exceeded_size:
+            stderr += f"\n[Output truncated: exceeded {limit} bytes limit]"
+
+        if timed_out:
+            stderr += f"\nAgent process group timed out after {effective_timeout}s and was terminated."
+
+        if sec.redact_secrets:
+            stdout = redact_secrets(stdout)
+            stderr = redact_secrets(stderr)
+
+        return ProcessResult(
+            command=cmd_parts,
+            exit_code=exit_code,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            timed_out=timed_out,
+            error=f"TimeoutExpired ({effective_timeout}s)" if timed_out else None,
+        )
+
+    except Exception as exc:
+        duration_ms = int((time.perf_counter() - start_t) * 1000)
+        return ProcessResult(
+            command=cmd_parts,
+            exit_code=-1,
+            stdout="",
+            stderr=str(exc),
+            duration_ms=duration_ms,
+            timed_out=False,
+            error=str(exc),
+        )
+
+    finally:
+        if proc and proc.pid:
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            else:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass

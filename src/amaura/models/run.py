@@ -10,6 +10,7 @@ from amaura.models.claim import Claim
 from amaura.models.evidence import EvidenceItem
 from amaura.models.finding import Finding
 from amaura.models.task import TaskSpec
+from amaura.models.usage import AgentUsage
 
 
 class OverallVerdict(str, Enum):
@@ -46,4 +47,5 @@ class RunRecord(BaseModel):
     unverified_areas: list[str] = Field(default_factory=list)
     artifacts_manifest: dict[str, str] = Field(default_factory=dict)
     artifacts_diff: dict[str, list[str]] = Field(default_factory=dict)
+    agent_usage: AgentUsage | None = None
 

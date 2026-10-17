@@ -156,6 +156,13 @@ def run_and_verify(
             extra_limitations=[f"Agent '{agent_name}' result: success={agent_res.success}"],
         )
 
+        # F4: Record agent token and cost usage
+        if agent_res.usage:
+            record.agent_usage = agent_res.usage
+            record.limitations.append(
+                f"Agent usage: {agent_res.usage.total_tokens} tokens (${agent_res.usage.estimated_cost_usd:.4f})"
+            )
+
         # D4: Do not ignore agent failure
         if not agent_res.success:
             record.findings.append(
