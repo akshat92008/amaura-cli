@@ -1,7 +1,9 @@
+"""Deterministic verdict evaluator applying explicit fail-closed rules to evidence and findings."""
+
 from typing import Optional
 
 from amaura.config import PolicyProfile
-from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus
+from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus, CheckType
 from amaura.models.claim import Claim, ClaimStatus
 from amaura.models.finding import Finding, FindingSeverity, FindingType
 from amaura.models.run import OverallVerdict
@@ -24,8 +26,8 @@ class VerdictResult:
 
 
 class VerdictEvaluator:
-    """Evaluates verification outcomes strictly through explicit, deterministic rules.
-    Never relies on unexplained confidence scores or majority votes.
+    """Evaluates verification outcomes strictly through explicit, deterministic fail-closed rules.
+    Zero-checks, unverified claims, timeouts, or critical defects can never evaluate to success.
     """
 
     def __init__(self, policy: VerdictPolicy):
@@ -44,24 +46,39 @@ class VerdictEvaluator:
         unverified: list[str] = []
         ev_items = evidence or []
 
-        # Index executions by check_id
+        # 0. Fail-closed on zero checks or empty executions
+        if not checks or not executions:
+            overall = OverallVerdict.FAILED if self.policy.profile == PolicyProfile.STRICT else OverallVerdict.INCONCLUSIVE
+            reasons.append("Zero verification checks executed. An empty check suite cannot establish requirement satisfaction.")
+            updated_claims = [Claim.model_validate(c.model_dump()) for c in claims]
+            for uc in updated_claims:
+                uc.status = ClaimStatus.NOT_CHECKED
+                uc.limitations.append("No verification checks executed.")
+                unverified.append(uc.text)
+            return VerdictResult(overall, reasons, updated_claims, unverified)
+
         exec_map: dict[str, CheckExecution] = {e.check_id: e for e in executions}
         check_map: dict[str, CheckDefinition] = {c.check_id: c for c in checks}
 
-        # 1. Check for critical defects and unmet mandatory requirements
-        critical_findings = [f for f in findings if f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.is_blocking]
-        gap_findings = [f for f in findings if f.finding_type in (FindingType.TEST_GAP, FindingType.VERIFICATION_GAP)]
+        # 1. Identify defects and execution statuses
+        critical_defects = [
+            f for f in findings
+            if f.finding_type == FindingType.DEFECT and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH)
+        ]
+        gap_findings = [
+            f for f in findings
+            if f.finding_type in (FindingType.TEST_GAP, FindingType.VERIFICATION_GAP)
+        ]
 
-        # 2. Check execution statuses for mandatory checks
         failed_mandatory_checks: list[str] = []
         timed_out_checks: list[str] = []
-        missing_checks: list[str] = []
+        missing_mandatory_checks: list[str] = []
 
         for check in checks:
             exec_item = exec_map.get(check.check_id)
             if not exec_item or exec_item.status == CheckStatus.NOT_RUN:
                 if check.mandatory:
-                    missing_checks.append(check.name)
+                    missing_mandatory_checks.append(check.name)
             elif exec_item.status == CheckStatus.FAILED:
                 if check.mandatory:
                     failed_mandatory_checks.append(check.name)
@@ -71,10 +88,13 @@ class VerdictEvaluator:
                 if check.mandatory:
                     failed_mandatory_checks.append(check.name)
 
-        # 3. Update individual Claim statuses based on evidence
+        # 2. Update individual Claim statuses based on dedicated acceptance checks
         updated_claims: list[Claim] = []
         for claim in claims:
-            # Find checks for this claim
+            # Deep clone to avoid mutating input claim objects
+            claim_copy = Claim.model_validate(claim.model_dump())
+
+            # Find checks specifically targeting this claim or requirement
             relevant_checks = [
                 c for c in checks
                 if c.target_claim_id == claim.claim_id
@@ -82,34 +102,38 @@ class VerdictEvaluator:
             ]
             relevant_check_ids = {c.check_id for c in relevant_checks}
 
-            # Find findings for this claim
+            # Acceptance checks (functional behavior verification, not merely build/syntax)
+            acceptance_checks = [
+                c for c in relevant_checks
+                if c.check_type in (CheckType.ACCEPTANCE_TEST, CheckType.TEST, CheckType.RECALCULATION)
+            ]
+
+            # Findings linked to this claim
             claim_findings = [
                 f for f in findings
                 if f.claim_id == claim.claim_id
                 or (claim.target_requirement_id and f.check_id in relevant_check_ids)
             ]
-
-            blocking_claim_findings = [
+            claim_defects = [
                 f for f in claim_findings
-                if f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.finding_type == FindingType.DEFECT
+                if f.finding_type == FindingType.DEFECT and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH)
             ]
-
-            gap_claim_findings = [
+            claim_gaps = [
                 f for f in claim_findings
                 if f.finding_type in (FindingType.TEST_GAP, FindingType.VERIFICATION_GAP)
             ]
 
             has_failed_check = any(
-                exec_map.get(c.check_id) and exec_map[c.check_id].status in (CheckStatus.FAILED, CheckStatus.ERROR)
+                exec_map.get(c.check_id) and exec_map[c.check_id].status in (CheckStatus.FAILED, CheckStatus.ERROR, CheckStatus.TIMED_OUT)
                 for c in relevant_checks
             )
 
-            has_passed_check = any(
+            has_passed_acceptance = any(
                 exec_map.get(c.check_id) and exec_map[c.check_id].status == CheckStatus.PASSED
-                for c in relevant_checks
+                for c in acceptance_checks
             )
 
-            # Match evidence items
+            # Match evidence
             supporting_ev = [
                 ev.evidence_id for ev in ev_items
                 if (ev.claim_id == claim.claim_id or ev.check_id in relevant_check_ids)
@@ -121,61 +145,68 @@ class VerdictEvaluator:
                 and exec_map.get(ev.check_id) and exec_map[ev.check_id].status in (CheckStatus.FAILED, CheckStatus.ERROR)
             ]
 
-            claim_copy = claim.model_copy()
             claim_copy.supporting_evidence_ids = supporting_ev
             claim_copy.contradicting_evidence_ids = contradicting_ev
 
-            if blocking_claim_findings or has_failed_check:
+            if claim_defects or has_failed_check:
                 claim_copy.status = ClaimStatus.CONTRADICTED
                 claim_copy.limitations.append("Contradicted by observed test failure or defect.")
-            elif gap_claim_findings or not relevant_checks or not has_passed_check:
+            elif claim_gaps or not acceptance_checks or not has_passed_acceptance:
                 claim_copy.status = ClaimStatus.INCONCLUSIVE
-                claim_copy.limitations.append("Insufficient evidence or requirement coverage gap.")
+                claim_copy.limitations.append("Insufficient evidence: missing or unexecuted dedicated acceptance test.")
                 unverified.append(claim.text)
             else:
                 claim_copy.status = ClaimStatus.SUPPORTED
 
             updated_claims.append(claim_copy)
 
-        # 4. Formulate overall verdict with fail-closed rules
-        if failed_mandatory_checks:
+        # 3. Formulate overall verdict with fail-closed rules
+        # Precedence: FAILED > INCONCLUSIVE > PASSED
+
+        # Case A: Critical failures, failed mandatory checks, or contradicted claims
+        any_claim_contradicted = any(c.status == ClaimStatus.CONTRADICTED for c in updated_claims)
+        if failed_mandatory_checks or critical_defects or any_claim_contradicted:
             overall = OverallVerdict.FAILED
             for chk_name in failed_mandatory_checks:
                 reasons.append(f"Mandatory verification check failed: '{chk_name}'")
-            if critical_findings:
-                reasons.append(f"{len(critical_findings)} blocking defect(s) detected during verification.")
+            for f in critical_defects:
+                reasons.append(f"Critical defect: {f.title} ({f.description[:120]})")
+            if any_claim_contradicted and not reasons:
+                reasons.append("One or more claims were contradicted by observed evidence.")
 
-        elif timed_out_checks and self.policy.config.fail_closed_on_timeout:
+        # Case B: Timed out mandatory checks (fail-closed)
+        elif timed_out_checks:
             overall = OverallVerdict.FAILED
             for chk_name in timed_out_checks:
-                reasons.append(f"Verification check exceeded budget and timed out: '{chk_name}'")
+                reasons.append(f"Mandatory check exceeded budget and timed out: '{chk_name}'")
 
-        elif critical_findings:
-            overall = OverallVerdict.FAILED
-            for f in critical_findings:
-                reasons.append(f"Blocking finding: {f.title} ({f.description[:120]})")
-
-        elif missing_checks and self.policy.config.fail_closed_on_missing_check:
+        # Case C: Missing mandatory checks or untested requirement gaps
+        elif missing_mandatory_checks or gap_findings:
             if self.policy.profile == PolicyProfile.STRICT:
                 overall = OverallVerdict.FAILED
-                reasons.append(f"Missing mandatory verification checks in strict mode: {', '.join(missing_checks)}")
+                if missing_mandatory_checks:
+                    reasons.append(f"Strict policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
+                for g in gap_findings:
+                    reasons.append(f"Strict policy failure: {g.title} - {g.description[:120]}")
             else:
                 overall = OverallVerdict.INCONCLUSIVE
-                reasons.append(f"Mandatory checks were not executed: {', '.join(missing_checks)}")
+                if missing_mandatory_checks:
+                    reasons.append(f"Mandatory checks were not executed: {', '.join(missing_mandatory_checks)}")
+                for g in gap_findings:
+                    reasons.append(f"Verification gap: {g.title} - {g.description[:120]}")
 
-        elif gap_findings:
-            # We detected a test gap or vacuous test (e.g. tests pass but an acceptance requirement is untested)
+        # Case D: Claims check: all claims corresponding to mandatory requirements must be SUPPORTED
+        elif any(c.status in (ClaimStatus.INCONCLUSIVE, ClaimStatus.NOT_CHECKED) for c in updated_claims):
+            inconclusive_claims = [c.text for c in updated_claims if c.status in (ClaimStatus.INCONCLUSIVE, ClaimStatus.NOT_CHECKED)]
             if self.policy.profile == PolicyProfile.STRICT:
                 overall = OverallVerdict.FAILED
-                for g in gap_findings:
-                    reasons.append(f"Strict policy failure: {g.title} - {g.description}")
+                reasons.append(f"Strict policy failure: Unverified claims: {'; '.join(inconclusive_claims[:3])}")
             else:
                 overall = OverallVerdict.INCONCLUSIVE
-                for g in gap_findings:
-                    reasons.append(f"Verification gap: {g.title} - {g.description}")
+                reasons.append(f"Unverified claims remaining: {'; '.join(inconclusive_claims[:3])}")
 
+        # Case E: All passed cleanly
         else:
-            # All mandatory checks passed, no blocking defects or test gaps
             overall = OverallVerdict.PASSED
             reasons.append("All mandatory acceptance and quality checks passed with supporting evidence.")
 

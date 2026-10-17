@@ -1,7 +1,8 @@
-"""Task and requirement intake and compilation."""
+"""Task and requirement intake, parsing, and cryptographic integrity validation."""
 
 import re
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
@@ -10,13 +11,17 @@ from amaura.models.task import Requirement, RiskLevel, TaskSpec
 
 
 def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
-    """Parses a markdown task document into a structured TaskSpec."""
+    """Parses a markdown task document into a structured TaskSpec without corrupting inline numbers."""
     lines = content.splitlines()
-    instruction_lines = []
+    instruction_lines: list[str] = []
     requirements: list[Requirement] = []
     constraints: list[str] = []
     assumptions: list[str] = []
+    acceptance_criteria: list[str] = []
     current_section = "instruction"
+
+    bullet_regex = re.compile(r"^(?:[-*]|\d+\.)\s+(.+)$")
+    strip_bullet_regex = re.compile(r"^(?:[-*]|\d+\.)\s*(?:\[[ xX]\]\s*)?")
 
     req_index = 1
     for line in lines:
@@ -38,10 +43,10 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
 
         if current_section == "instruction":
             instruction_lines.append(line)
+
         elif current_section == "requirements":
-            item_match = re.match(r"^[-*]|\d+\.\s*(.+)$", stripped)
-            if item_match and stripped:
-                text = re.sub(r"^[-*]|\d+\.\s*(\[[ xX]\]\s*)?", "", stripped).strip()
+            if bullet_regex.match(stripped):
+                text = strip_bullet_regex.sub("", stripped).strip()
                 if text:
                     # Check for mandatory annotation
                     mandatory = not ("[advisory]" in text.lower() or "[optional]" in text.lower())
@@ -53,27 +58,33 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
                     )
                     requirements.append(req)
                     req_index += 1
+
         elif current_section == "constraints":
-            if stripped.startswith(("-", "*")) or re.match(r"^\d+\.", stripped):
-                text = re.sub(r"^[-*]|\d+\.\s*", "", stripped).strip()
+            if bullet_regex.match(stripped):
+                text = strip_bullet_regex.sub("", stripped).strip()
                 if text:
                     constraints.append(text)
+
         elif current_section == "assumptions":
-            if stripped.startswith(("-", "*")) or re.match(r"^\d+\.", stripped):
-                text = re.sub(r"^[-*]|\d+\.\s*", "", stripped).strip()
+            if bullet_regex.match(stripped):
+                text = strip_bullet_regex.sub("", stripped).strip()
                 if text:
                     assumptions.append(text)
 
-    instruction = "\n".join(instruction_lines).strip()
-    if not instruction and not requirements:
-        raise TaskSpecificationError("Task document contains neither instructions nor requirements")
+        elif current_section == "acceptance_criteria":
+            if bullet_regex.match(stripped):
+                text = strip_bullet_regex.sub("", stripped).strip()
+                if text:
+                    acceptance_criteria.append(text)
 
-    # If no explicit requirements section was found, extract bullet points or paragraphs as requirements
+    instruction = "\n".join(instruction_lines).strip()
+
+    # If no explicit requirements section was found, parse top-level bullets as requirements
     if not requirements:
-        for idx, line in enumerate(lines, start=1):
+        for line in lines:
             s = line.strip()
-            if s.startswith(("-", "*", "1.", "2.", "3.", "4.", "5.")):
-                clean_text = re.sub(r"^[-*]|\d+\.\s*", "", s).strip()
+            if bullet_regex.match(s):
+                clean_text = strip_bullet_regex.sub("", s).strip()
                 if len(clean_text) > 5:
                     requirements.append(
                         Requirement(
@@ -84,6 +95,11 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
                         )
                     )
 
+    if not requirements:
+        raise TaskSpecificationError(
+            "Task specification must contain at least one verifiable requirement. An empty requirement set cannot be verified."
+        )
+
     task_id = Path(filename).stem
     task = TaskSpec(
         task_id=task_id,
@@ -91,12 +107,13 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
         requirements=requirements,
         constraints=constraints,
         assumptions=assumptions,
+        acceptance_criteria=acceptance_criteria,
     )
     return task.freeze()
 
 
-def load_task_file(task_path: Path) -> TaskSpec:
-    """Loads a TaskSpec from a Markdown, YAML, or JSON file."""
+def load_task_file(task_path: Path, expected_hash: Optional[str] = None) -> TaskSpec:
+    """Loads and validates a TaskSpec from a Markdown or YAML file, enforcing hash integrity if specified."""
     if not task_path.is_file():
         raise TaskSpecificationError(f"Task file not found: {task_path}")
 
@@ -108,6 +125,18 @@ def load_task_file(task_path: Path) -> TaskSpec:
         if not isinstance(data, dict):
             raise TaskSpecificationError("YAML task specification must be a dictionary")
         task = TaskSpec.model_validate(data)
-        return task.freeze()
+        if not task.requirements:
+            raise TaskSpecificationError("Task specification must contain at least one requirement.")
+        if not task.frozen:
+            task.freeze()
     else:
-        return parse_markdown_task(content, filename=task_path.name)
+        task = parse_markdown_task(content, filename=task_path.name)
+
+    # Enforce hash verification if expected_hash provided
+    if expected_hash and task.task_hash != expected_hash:
+        raise TaskSpecificationError(
+            f"Task integrity violation: Task specification hash mismatch! "
+            f"Expected: {expected_hash}, Computed: {task.task_hash}. The task was modified after freezing."
+        )
+
+    return task

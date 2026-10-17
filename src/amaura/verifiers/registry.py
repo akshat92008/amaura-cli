@@ -1,6 +1,8 @@
 """Registry for domain-specific verifiers."""
 
+
 from amaura.config import AmauraConfig
+from amaura.errors import VerificationError
 from amaura.verifiers.base import BaseVerifier
 from amaura.verifiers.calculations import CalculationVerifier
 from amaura.verifiers.citations import CitationVerifier
@@ -25,7 +27,11 @@ class VerifierRegistry:
         }
 
     def get(self, name: str) -> BaseVerifier:
-        return self._verifiers.get(name, self._verifiers["code"])
+        if name not in self._verifiers:
+            raise VerificationError(
+                f"Unknown verifier: '{name}'. Available verifiers: {sorted(self._verifiers.keys())}"
+            )
+        return self._verifiers[name]
 
     def register(self, name: str, verifier: BaseVerifier) -> None:
         self._verifiers[name] = verifier

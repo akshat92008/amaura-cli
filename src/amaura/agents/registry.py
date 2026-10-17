@@ -5,6 +5,7 @@ from amaura.agents.adapters.artifact_only import ArtifactOnlyAdapter
 from amaura.agents.adapters.local_cli import LocalCLIAdapter
 from amaura.agents.adapters.mock_agent import MockAgentAdapter
 from amaura.agents.base import BaseAgentAdapter
+from amaura.errors import AdapterError
 
 
 class AgentRegistry:
@@ -18,7 +19,11 @@ class AgentRegistry:
         }
 
     def get(self, name: str) -> BaseAgentAdapter:
-        return self._adapters.get(name, self._adapters["artifact_only"])
+        if name not in self._adapters:
+            raise AdapterError(
+                f"Unknown agent adapter: '{name}'. Available adapters: {sorted(self._adapters.keys())}"
+            )
+        return self._adapters[name]
 
     def list_adapters(self) -> list[BaseAgentAdapter]:
         return list(self._adapters.values())

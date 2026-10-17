@@ -1,22 +1,23 @@
-"""Version A: Correct CSV Importer with duplicate detection and safe malformed input rejection."""
+"""Version A: Correct CSV Importer with duplicate detection and safe malformed input rejection (stdlib only)."""
 
 import csv
 import io
+from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field
 
-
-class ImportErrorDetail(BaseModel):
+@dataclass
+class ImportErrorDetail:
     line_number: int
     reason: str
 
 
-class ImportResult(BaseModel):
+@dataclass
+class ImportResult:
     success: bool
-    records: list[dict[str, Any]] = Field(default_factory=list)
-    duplicates: list[dict[str, Any]] = Field(default_factory=list)
-    errors: list[ImportErrorDetail] = Field(default_factory=list)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    duplicates: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[ImportErrorDetail] = field(default_factory=list)
 
 
 def import_csv(content: str, key_field: str = "id") -> ImportResult:

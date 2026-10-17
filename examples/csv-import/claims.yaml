@@ -11,3 +11,7 @@ claims:
     text: "The application safely rejects malformed inputs without unhandled crashes"
     claim_type: "behavioral"
     target_requirement_id: "REQ-003"
+  - claim_id: "CLM-004"
+    text: "Sensitive fields such as passwords or SSN are never logged or leaked"
+    claim_type: "behavioral"
+    target_requirement_id: "REQ-004"

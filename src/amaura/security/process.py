@@ -1,15 +1,35 @@
-"""Safe isolated subprocess execution."""
+"""Safe isolated subprocess execution with process group cleanup and strict environment allowlists."""
 
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
+from typing import Optional
 
 from pydantic import BaseModel
 
 from amaura.config import BudgetConfig, SecurityConfig
 from amaura.security.permissions import validate_command
 from amaura.security.redaction import redact_secrets
+
+# Strict allowlist of safe system environment variables.
+# All unapproved caller environment variables (API keys, DB URLs, secret tokens) are stripped.
+SAFE_ENV_ALLOWLIST = {
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "SYSTEMROOT",
+    "COMSPEC",
+    "PATHEXT",
+}
 
 
 class ProcessResult(BaseModel):
@@ -19,19 +39,19 @@ class ProcessResult(BaseModel):
     stderr: str
     duration_ms: int
     timed_out: bool = False
-    error: str | None = None
+    error: Optional[str] = None
 
 
 def run_safe_process(
     command: list[str] | str,
     cwd: Path,
-    env: dict[str, str] | None = None,
-    timeout_seconds: int | None = None,
-    security_config: SecurityConfig | None = None,
-    budget_config: BudgetConfig | None = None,
+    env: Optional[dict[str, str]] = None,
+    timeout_seconds: Optional[int] = None,
+    security_config: Optional[SecurityConfig] = None,
+    budget_config: Optional[BudgetConfig] = None,
 ) -> ProcessResult:
-    """Executes a command safely without shell expansion, enforcing timeouts, environment sanitization,
-    secret redaction, and bounded output capture.
+    """Executes a command in an isolated process group with a strict environment allowlist,
+    clean process-tree termination on timeout, secret redaction, and bounded capture.
     """
     sec = security_config or SecurityConfig()
     bud = budget_config or BudgetConfig()
@@ -41,15 +61,26 @@ def run_safe_process(
     effective_timeout = timeout_seconds if timeout_seconds is not None else bud.default_timeout_seconds
     effective_timeout = min(effective_timeout, sec.max_timeout_seconds)
 
-    # Sanitize environment
-    clean_env = dict(os.environ)
-    for forbidden_var in sec.forbidden_env_vars:
-        clean_env.pop(forbidden_var, None)
+    # 1. Enforce strict environment allowlist
+    clean_env: dict[str, str] = {}
+    for var_name in SAFE_ENV_ALLOWLIST:
+        if var_name in os.environ:
+            clean_env[var_name] = os.environ[var_name]
 
-    # Disable network if privacy_mode is LOCAL_ONLY or sec.allow_network is False
+    # Ensure minimal working PATH if stripped
+    if "PATH" not in clean_env:
+        clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    # Enforce offline behavior flags and proxy dead-ends when network is disabled
     if sec.privacy_mode.value == "local_only" or not sec.allow_network:
-        # Enforce offline behavior flags in common tools
-        clean_env["NO_PROXY"] = "*"
+        # Direct all HTTP/HTTPS requests to an invalid local port to fail fast
+        clean_env["http_proxy"] = "http://127.0.0.1:0"
+        clean_env["https_proxy"] = "http://127.0.0.1:0"
+        clean_env["all_proxy"] = "http://127.0.0.1:0"
+        clean_env["HTTP_PROXY"] = "http://127.0.0.1:0"
+        clean_env["HTTPS_PROXY"] = "http://127.0.0.1:0"
+        clean_env["ALL_PROXY"] = "http://127.0.0.1:0"
+        clean_env["NO_PROXY"] = ""
         clean_env["PIP_NO_INDEX"] = "1"
         clean_env["PIP_OFFLINE"] = "1"
 
@@ -57,60 +88,87 @@ def run_safe_process(
         clean_env.update(env)
 
     start_t = time.perf_counter()
+    proc: Optional[subprocess.Popen] = None
     try:
-        proc = subprocess.run(
+        # Run in a new session / process group so child processes can be killed together
+        proc = subprocess.Popen(
             cmd_parts,
             cwd=str(cwd.resolve()),
             env=clean_env,
-            capture_output=True,
-            timeout=effective_timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            shell=False,  # strictly non-shell
-        )
-        duration_ms = int((time.perf_counter() - start_t) * 1000)
-
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
-
-        # Enforce max capture limits
-        if len(stdout) > bud.max_output_capture_bytes:
-            stdout = stdout[:bud.max_output_capture_bytes] + "\n...[TRUNCATED_DUE_TO_SIZE]"
-        if len(stderr) > bud.max_output_capture_bytes:
-            stderr = stderr[:bud.max_output_capture_bytes] + "\n...[TRUNCATED_DUE_TO_SIZE]"
-
-        if sec.redact_secrets:
-            stdout = redact_secrets(stdout)
-            stderr = redact_secrets(stderr)
-
-        return ProcessResult(
-            command=cmd_parts,
-            exit_code=proc.returncode,
-            stdout=stdout,
-            stderr=stderr,
-            duration_ms=duration_ms,
-            timed_out=False,
+            shell=False,
+            start_new_session=True,  # Creates process group on POSIX
         )
 
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = int((time.perf_counter() - start_t) * 1000)
-        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        err = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        try:
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
+            duration_ms = int((time.perf_counter() - start_t) * 1000)
+            exit_code = proc.returncode
 
-        if sec.redact_secrets:
-            out = redact_secrets(out)
-            err = redact_secrets(err)
+            stdout = stdout or ""
+            stderr = stderr or ""
 
-        return ProcessResult(
-            command=cmd_parts,
-            exit_code=-1,
-            stdout=out,
-            stderr=err + f"\nProcess timed out after {effective_timeout}s",
-            duration_ms=duration_ms,
-            timed_out=True,
-            error=f"TimeoutExpired ({effective_timeout}s)",
-        )
+            # Enforce max capture limits
+            if len(stdout) > bud.max_output_capture_bytes:
+                stdout = stdout[:bud.max_output_capture_bytes] + "\n...[TRUNCATED_DUE_TO_SIZE]"
+            if len(stderr) > bud.max_output_capture_bytes:
+                stderr = stderr[:bud.max_output_capture_bytes] + "\n...[TRUNCATED_DUE_TO_SIZE]"
+
+            if sec.redact_secrets:
+                stdout = redact_secrets(stdout)
+                stderr = redact_secrets(stderr)
+
+            return ProcessResult(
+                command=cmd_parts,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                timed_out=False,
+            )
+
+        except subprocess.TimeoutExpired:
+            # Terminate the entire process group to avoid orphan processes
+            duration_ms = int((time.perf_counter() - start_t) * 1000)
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            else:
+                proc.kill()
+
+            stdout, stderr = proc.communicate()
+            stdout = stdout or ""
+            stderr = (stderr or "") + f"\nProcess group timed out after {effective_timeout}s and was terminated."
+
+            if sec.redact_secrets:
+                stdout = redact_secrets(stdout)
+                stderr = redact_secrets(stderr)
+
+            return ProcessResult(
+                command=cmd_parts,
+                exit_code=-1,
+                stdout=stdout,
+                stderr=stderr,
+                duration_ms=duration_ms,
+                timed_out=True,
+                error=f"TimeoutExpired ({effective_timeout}s)",
+            )
+
     except Exception as exc:
         duration_ms = int((time.perf_counter() - start_t) * 1000)
+        if proc and proc.poll() is None:
+            if hasattr(os, "killpg"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+            else:
+                proc.kill()
+
         return ProcessResult(
             command=cmd_parts,
             exit_code=-1,

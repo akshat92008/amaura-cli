@@ -29,3 +29,14 @@ def test_malformed_csv_safe_rejection():
     assert len(res.errors) == 2
     assert res.errors[0].line_number == 3
     assert "expected 3 columns" in res.errors[0].reason
+
+
+def test_sensitive_data_not_logged(capsys):
+    content = "id,name,password,ssn\n1,Alice,SecretP@ss,123-45-6789\n"
+    res = import_csv(content)
+    assert res.success is True
+    captured = capsys.readouterr()
+    assert "SecretP@ss" not in captured.out
+    assert "SecretP@ss" not in captured.err
+    assert "123-45-6789" not in captured.out
+    assert "123-45-6789" not in captured.err

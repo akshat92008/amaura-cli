@@ -4,6 +4,7 @@ import platform
 import shutil
 import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -13,7 +14,7 @@ from rich.table import Table
 from amaura.agents.registry import AgentRegistry
 from amaura.benchmarks.runner import BenchmarkCase, BenchmarkRunner
 from amaura.config import AmauraConfig, PolicyProfile, PrivacyMode
-from amaura.errors import AmauraError
+from amaura.errors import AmauraError, EvidenceIntegrityError
 from amaura.evidence.ledger import EvidenceLedger
 from amaura.models.check import CheckStatus
 from amaura.models.run import OverallVerdict
@@ -25,6 +26,8 @@ from amaura.orchestration.runner import (
 )
 from amaura.reporting.json_report import generate_json_report
 from amaura.reporting.markdown import generate_markdown_report
+from amaura.security.redaction import redact_secrets
+from amaura.security.workspace import validate_path_within_workspace
 
 app = typer.Typer(
     name="amaura",
@@ -89,7 +92,7 @@ def doctor(
     if pytest_path:
         table.add_row("Test Runner (pytest)", "[green]PASS[/green]", pytest_path)
     else:
-        table.add_row("Test Runner", "[green]PASS[/green]", "built-in unittest fallback available")
+        table.add_row("Test Runner (pytest)", "[red]FAIL[/red]", "pytest is required on PATH for code verification")
 
     # Security configuration
     cfg = AmauraConfig.load()
@@ -98,12 +101,36 @@ def doctor(
 
     # Redaction
     redaction_status = "[green]ENABLED[/green]" if cfg.security.redact_secrets else "[red]DISABLED[/red]"
-    table.add_row("Secret Redaction", redaction_status, "API keys, tokens, and private keys scrubbed from logs")
+    table.add_row("Secret Redaction", redaction_status, "Credentials, keys, and tokens scrubbed from evidence")
 
-    # Configuration file
+    # Active Config
     config_file = AmauraConfig.find_config_path()
     cfg_loc = str(config_file) if config_file else "Defaults (in-memory)"
     table.add_row("Active Config", "[green]LOADED[/green]", cfg_loc)
+
+    # Security checks
+    if check_security:
+        # Test secret redactor
+        test_secret = "Bearer sk-1234567890abcdef1234567890"
+        redacted = redact_secrets(test_secret)
+        redact_pass = "[REDACTED" in redacted
+        table.add_row(
+            "Security: Redactor Probe",
+            "[green]PASS[/green]" if redact_pass else "[red]FAIL[/red]",
+            "Verified secret pattern interception",
+        )
+
+        # Test path traversal containment
+        try:
+            validate_path_within_workspace(Path("/etc/passwd"), Path("/tmp"))
+            traversal_pass = False
+        except Exception:
+            traversal_pass = True
+        table.add_row(
+            "Security: Path Containment",
+            "[green]PASS[/green]" if traversal_pass else "[red]FAIL[/red]",
+            "Verified out-of-workspace traversal prevention",
+        )
 
     console.print(table)
 
@@ -132,8 +159,8 @@ def agents():
 @app.command()
 def verify(
     path: Path = typer.Argument(Path("."), help="Path to project directory to verify"),
-    task: Path | None = typer.Option(None, "--task", "-t", help="Path to task specification file"),
-    profile: PolicyProfile | None = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
+    task: Optional[Path] = typer.Option(None, "--task", "-t", help="Path to task specification file"),
+    profile: Optional[PolicyProfile] = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
     no_network: bool = typer.Option(True, "--no-network/--allow-network", help="Enforce local-only isolated execution"),
 ):
     """Run applicable checks on existing work."""
@@ -162,10 +189,10 @@ def verify(
 @app.command()
 def audit(
     path: Path = typer.Argument(Path("."), help="Path to project to audit"),
-    task: Path | None = typer.Option(None, "--task", "-t", help="Path to task specification file"),
+    task: Optional[Path] = typer.Option(None, "--task", "-t", help="Path to task specification file"),
     format: str = typer.Option("text", "--format", "-f", help="Output format: text, json, or markdown"),
 ):
-    """Audit completed work without assuming it is trustworthy (non-destructive)."""
+    """Audit completed work without assuming it is trustworthy (strictly non-destructive)."""
     cfg = AmauraConfig.load(start_dir=path)
     try:
         record = audit_project(project_dir=path, task_file=task, config=cfg)
@@ -178,6 +205,8 @@ def audit(
 
         if record.overall_verdict == OverallVerdict.FAILED:
             raise typer.Exit(code=1)
+        elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
+            raise typer.Exit(code=2)
     except AmauraError as exc:
         console.print(f"[red]Audit Error:[/red] {exc.message}")
         raise typer.Exit(code=1)
@@ -194,6 +223,8 @@ def claim_check(
         _print_run_summary(record)
         if record.overall_verdict == OverallVerdict.FAILED:
             raise typer.Exit(code=1)
+        elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
+            raise typer.Exit(code=2)
     except AmauraError as exc:
         console.print(f"[red]Claim-Check Error:[/red] {exc.message}")
         raise typer.Exit(code=1)
@@ -208,7 +239,18 @@ def report(
     """Display findings and evidence-backed verdict of a verification run."""
     cfg = AmauraConfig.load()
     ledger = EvidenceLedger(Path(cfg.runs_dir))
-    record = ledger.load_run(run_id)
+
+    try:
+        record = ledger.load_run(run_id, verify_integrity=True)
+    except EvidenceIntegrityError as exc:
+        console.print(Panel(
+            f"[bold red]CRITICAL: TAMPER DETECTED IN RUN AUDIT PACKAGE[/bold red]\n{exc.message}",
+            title="Evidence Integrity Error",
+        ))
+        raise typer.Exit(code=1)
+    except AmauraError as exc:
+        console.print(f"[red]Error loading run:[/red] {exc.message}")
+        raise typer.Exit(code=1)
 
     if not record:
         console.print(f"[red]Run '{run_id}' not found in ledger at {ledger.runs_dir}[/red]")
@@ -219,7 +261,6 @@ def report(
     elif format == "markdown":
         console.print(generate_markdown_report(record))
     else:
-        # Rich formatted report
         _print_run_summary(record, show_evidence=show_evidence)
 
 
@@ -231,13 +272,17 @@ def evidence(
     """Inspect the raw evidence associated with a claim or check."""
     cfg = AmauraConfig.load()
     ledger = EvidenceLedger(Path(cfg.runs_dir))
-    record = ledger.load_run(run_id)
+
+    try:
+        record = ledger.load_run(run_id, verify_integrity=True)
+    except EvidenceIntegrityError as exc:
+        console.print(f"[red]Integrity Error:[/red] {exc.message}")
+        raise typer.Exit(code=1)
 
     if not record:
         console.print(f"[red]Run '{run_id}' not found.[/red]")
         raise typer.Exit(code=1)
 
-    # Search for matching evidence
     matched = [
         ev for ev in record.evidence
         if ev.evidence_id == id_arg or ev.check_id == id_arg or ev.claim_id == id_arg
@@ -257,41 +302,46 @@ def evidence(
 
 @app.command()
 def policy(
-    profile: PolicyProfile | None = typer.Option(None, "--profile", "-p", help="View specific policy profile"),
+    profile: Optional[PolicyProfile] = typer.Option(None, "--profile", "-p", help="View specific policy profile"),
 ):
-    """Display and validate the active verification policy."""
+    """Display and validate the active verification policy reflecting real configuration."""
     cfg = AmauraConfig.load()
-    prof = profile or cfg.policy.profile
+    p_cfg = cfg.policy
 
-    table = Table(title=f"Amaura Verification Policy — Profile: {prof.value.upper()}", show_header=True)
-    table.add_column("Rule / Directive", style="cyan")
-    table.add_column("Enforcement", style="bold")
+    table = Table(title=f"Amaura Active Verification Policy — Profile: {p_cfg.profile.value.upper()}", show_header=True)
+    table.add_column("Setting / Directive", style="cyan")
+    table.add_column("Value / State", style="bold")
     table.add_column("Description")
 
     table.add_row(
+        "Active Profile",
+        p_cfg.profile.value.upper(),
+        "Evaluation strictness profile (strict, standard, permissive)",
+    )
+    table.add_row(
+        "Fail-Closed on Timeout",
+        "[green]TRUE[/green]" if p_cfg.fail_closed_on_timeout else "[yellow]FALSE[/yellow]",
+        "Timed-out mandatory checks fail rather than silently passing",
+    )
+    table.add_row(
         "Fail-Closed on Missing Check",
-        "[green]STRICT[/green]",
-        "Mandatory requirement without executed check cannot pass (evaluated as inconclusive or failure)",
+        "[green]TRUE[/green]" if p_cfg.fail_closed_on_missing_check else "[yellow]FALSE[/yellow]",
+        "Mandatory requirement without executed test cannot evaluate to PASSED",
     )
     table.add_row(
-        "Critical Defect Precedence",
-        "[green]ENFORCED[/green]",
-        "Passing cosmetic/basic checks CANNOT override a critical failure",
+        "Require All Mandatory Tests",
+        "[green]TRUE[/green]" if p_cfg.require_all_mandatory_acceptance_tests else "[yellow]FALSE[/yellow]",
+        "Every mandatory requirement requires observed evidence",
     )
     table.add_row(
-        "Adversarial & Vacuous Test Check",
-        "[green]ENFORCED[/green]",
-        "Vacuous assertions (e.g. assert True) or missing requirement tests are flagged as verification gaps",
+        "Enforce Clean Git",
+        "[green]TRUE[/green]" if p_cfg.require_clean_git else "[dim]FALSE[/dim]",
+        "Require clean Git working tree before verification",
     )
     table.add_row(
-        "Zero-Cost Local Baseline",
-        "[green]ENFORCED[/green]",
-        "Verification kernel executes purely local deterministic tools with zero paid model dependencies",
-    )
-    table.add_row(
-        "Cryptographic Provenance",
-        "[green]ENFORCED[/green]",
-        "Every output, diff, and artifact is fingerprinted with SHA-256",
+        "Privacy Mode",
+        cfg.security.privacy_mode.value.upper(),
+        "Local-only execution with zero network transmission",
     )
 
     console.print(table)
@@ -299,14 +349,14 @@ def policy(
 
 @app.command()
 def benchmark(
-    suite: str = typer.Option("all", "--suite", "-s", help="Benchmark suite to execute (all or csv-import)"),
+    suite: str = typer.Option("all", "--suite", "-s", help="Benchmark suite to execute"),
 ):
     """Evaluate Amaura verification against standard defect fixtures and release gates."""
     base_dir = Path(__file__).resolve().parents[2]
     csv_example = base_dir / "examples" / "csv-import"
+    task_file = csv_example / "task.md"
 
     cases: list[BenchmarkCase] = []
-    task_file = csv_example / "task.md"
 
     if csv_example.exists():
         # Version A: Known Good
@@ -330,7 +380,7 @@ def benchmark(
                 category="known_bad",
             )
         )
-        # Version C: Test Gap (Duplicates untested)
+        # Version C: Test Gap (Duplicate requirement untested)
         cases.append(
             BenchmarkCase(
                 name="CSV Import (Version C - Duplicate Test Gap)",
@@ -365,7 +415,7 @@ def benchmark(
 def run(
     task: Path = typer.Argument(..., help="Path to task markdown file"),
     agent: str = typer.Option("artifact_only", "--agent", "-a", help="Agent adapter to operate"),
-    profile: PolicyProfile | None = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
+    profile: Optional[PolicyProfile] = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
 ):
     """Execute an agent workflow in an isolated workspace and verify the output."""
     try:
@@ -377,6 +427,8 @@ def run(
         _print_run_summary(record)
         if record.overall_verdict == OverallVerdict.FAILED:
             raise typer.Exit(code=1)
+        elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
+            raise typer.Exit(code=2)
     except AmauraError as exc:
         console.print(f"[red]Run Error:[/red] {exc.message}")
         raise typer.Exit(code=1)
@@ -392,7 +444,6 @@ def _print_run_summary(record, show_evidence: bool = False):
     }
     color = verdict_colors.get(record.overall_verdict, "bold white")
 
-    # Header panel
     task_desc = record.task.instruction.splitlines()[0] if record.task.instruction else record.task.task_id
     console.print(Panel(
         f"[bold]Task:[/bold] {task_desc}\n"
@@ -401,14 +452,12 @@ def _print_run_summary(record, show_evidence: bool = False):
         title=f"Amaura Verify Report — {record.task.task_id}",
     ))
 
-    # Reasons
     if record.verdict_reasons:
         console.print("[bold]Verdict Analysis:[/bold]")
         for reason in record.verdict_reasons:
             console.print(f" • {reason}")
         console.print()
 
-    # Checks summary table
     exec_map = {e.check_id: e for e in record.executions}
     chk_table = Table(title="Executed Checks & Verifications", show_header=True)
     chk_table.add_column("Check ID", style="dim")
@@ -419,21 +468,19 @@ def _print_run_summary(record, show_evidence: bool = False):
     for c in record.checks:
         e = exec_map.get(c.check_id)
         if e:
-            st_color = "green" if e.status == CheckStatus.PASSED else "red"
+            st_color = "green" if e.status == CheckStatus.PASSED else ("yellow" if e.status == CheckStatus.NOT_RUN else "red")
             chk_table.add_row(c.check_id, c.name, f"[{st_color}]{e.status.value.upper()}[/{st_color}]", f"{e.duration_ms}ms")
         else:
             chk_table.add_row(c.check_id, c.name, "[yellow]NOT_RUN[/yellow]", "-")
 
     console.print(chk_table)
 
-    # Findings
     if record.findings:
         console.print("\n[bold]Findings & Discrepancies:[/bold]")
         for f in record.findings:
             f_color = "red" if f.severity.value in ("critical", "high") else "yellow"
             console.print(f" • [{f_color}]{f.severity.value.upper()}[/{f_color}] [bold]{f.title}[/bold]: {f.description}")
 
-    # Evidence details
     if show_evidence and record.evidence:
         console.print("\n[bold]Captured Evidence Ledger:[/bold]")
         for ev in record.evidence:
