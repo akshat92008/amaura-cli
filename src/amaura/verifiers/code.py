@@ -6,7 +6,6 @@ import re
 import sys
 import tempfile
 import uuid
-import xml.etree.ElementTree as ET
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +14,8 @@ from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus, Ch
 from amaura.models.evidence import EvidenceType
 from amaura.models.finding import Finding, FindingSeverity, FindingType
 from amaura.security.process import run_safe_process
+from amaura.security.workspace import validate_path_within_workspace
+from amaura.security.xml import safe_parse_xml
 from amaura.verifiers.base import BaseVerifier, VerifierResult
 
 
@@ -364,6 +365,9 @@ class CodeVerifier(BaseVerifier):
         check: CheckDefinition,
         collector: EvidenceCollector,
     ) -> VerifierResult:
+        if check.metadata.get("target_file"):
+            validate_path_within_workspace(Path(check.metadata["target_file"]), project_dir)
+
         if check.check_type == CheckType.BUILD:
             return self._verify_build(project_dir, check, collector)
         elif check.check_type == CheckType.TEST:
@@ -391,6 +395,7 @@ class CodeVerifier(BaseVerifier):
         for p in project_dir.rglob("*.py"):
             if any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts):
                 continue
+            validate_path_within_workspace(p, project_dir)
             py_files.append(p)
             try:
                 compile(p.read_text(encoding="utf-8"), str(p), "exec")
@@ -521,8 +526,7 @@ class CodeVerifier(BaseVerifier):
 
             if junit_xml.is_file():
                 try:
-                    xml_tree = ET.parse(junit_xml)
-                    root = xml_tree.getroot()
+                    root = safe_parse_xml(junit_xml)
                     # Root can be <testsuites> or <testsuite>
                     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
                     for s in suites:
@@ -908,8 +912,7 @@ class CodeVerifier(BaseVerifier):
             total_ran = 0
             if junit_xml.is_file():
                 try:
-                    xml_tree = ET.parse(junit_xml)
-                    root = xml_tree.getroot()
+                    root = safe_parse_xml(junit_xml)
                     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
                     for s in suites:
                         total_ran += int(s.attrib.get("tests", 0))
@@ -960,8 +963,7 @@ class CodeVerifier(BaseVerifier):
                             m_failed = m_res.exit_code != 0 or m_res.timed_out
                             if junit_xml.is_file():
                                 try:
-                                    m_tree = ET.parse(junit_xml)
-                                    m_root = m_tree.getroot()
+                                    m_root = safe_parse_xml(junit_xml)
                                     m_suites = [m_root] if m_root.tag == "testsuite" else list(m_root.findall("testsuite"))
                                     for s in m_suites:
                                         if int(s.attrib.get("failures", 0)) > 0 or int(s.attrib.get("errors", 0)) > 0:

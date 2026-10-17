@@ -2,13 +2,20 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
 from amaura.agents.registry import AgentRegistry
 from amaura.config import AmauraConfig, PrivacyMode, SecurityConfig, VerificationPolicyConfig
-from amaura.errors import AdapterError, EvidenceIntegrityError, TaskSpecificationError, VerificationError
+from amaura.errors import (
+    AdapterError,
+    EvidenceIntegrityError,
+    ExecutionSecurityError,
+    TaskSpecificationError,
+    VerificationError,
+)
 from amaura.evidence.collector import EvidenceCollector
 from amaura.evidence.ledger import EvidenceLedger
 from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus, CheckType
@@ -870,4 +877,222 @@ def test_probe_b11_root_anchored_ignores_and_artifact_diff(tmp_path: Path):
     assert "new_file.txt" in diff["added"]
     assert str(Path("subpkg/.venv/keep.py")) in diff["modified"]
     assert len(diff["deleted"]) == 0
+
+
+def test_probe_c1_connect_ex_blocked(tmp_path: Path):
+    """Network connection attempts via socket.connect_ex or connect are blocked in sandbox (C1)."""
+    script = tmp_path / "net_probe.py"
+    script.write_text(
+        "import socket\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "try:\n"
+        "    code = s.connect_ex(('1.1.1.1', 80))\n"
+        "    print(f'CONNECTED_EX:{code}')\n"
+        "except Exception as e:\n"
+        "    print(f'CAUGHT_NET_EX:{type(e).__name__}')\n"
+    )
+    res = run_safe_process([sys.executable, str(script)], cwd=tmp_path)
+    assert "CAUGHT_NET_EX:PermissionError" in res.stdout or "PermissionError" in res.stderr
+    assert "CONNECTED_EX" not in res.stdout
+
+
+def test_probe_c2_write_outside_workspace_blocked(tmp_path: Path):
+    """Filesystem writes outside the designated workspace are strictly blocked (C2)."""
+    target_outside = Path.home() / f"probe_escape_{os.getpid()}.txt"
+    script = tmp_path / "fs_probe.py"
+    script.write_text(
+        f"try:\n"
+        f"    with open({str(target_outside)!r}, 'w') as f:\n"
+        f"        f.write('escaped')\n"
+        f"    print('WRITE_SUCCESS')\n"
+        f"except Exception as e:\n"
+        f"    print(f'CAUGHT_WRITE_EX:{{type(e).__name__}}')\n"
+    )
+    res = run_safe_process([sys.executable, str(script)], cwd=tmp_path)
+    assert "CAUGHT_WRITE_EX:PermissionError" in res.stdout or "PermissionError" in res.stderr
+    assert not target_outside.exists()
+
+
+def test_probe_c3_rlimits_enforced(tmp_path: Path):
+    """Process execution applies resource limits on CPU and file size (C3)."""
+    script = tmp_path / "rlimit_probe.py"
+    script.write_text(
+        "import resource, sys\n"
+        "soft_cpu, hard_cpu = resource.getrlimit(resource.RLIMIT_CPU)\n"
+        "soft_fsize, hard_fsize = resource.getrlimit(resource.RLIMIT_FSIZE)\n"
+        "print(f'RLIMIT_CPU:{soft_cpu}:{hard_cpu}')\n"
+        "print(f'RLIMIT_FSIZE:{soft_fsize}:{hard_fsize}')\n"
+    )
+    res = run_safe_process([sys.executable, str(script)], cwd=tmp_path)
+    assert res.exit_code == 0
+    assert "RLIMIT_CPU:" in res.stdout
+    assert "RLIMIT_FSIZE:" in res.stdout
+    parts = res.stdout.split()
+    cpu_line = next(p for p in parts if p.startswith("RLIMIT_CPU:"))
+    soft_c = int(cpu_line.split(":")[1])
+    assert soft_c > 0 and soft_c <= 600
+
+
+def test_probe_c4_sudoku_allowed_and_python_c_bypass_blocked():
+    """Command filter allows substring words like test_sudoku_solver but blocks python -c bypass (C4)."""
+    from amaura.security.permissions import validate_command
+    sec = SecurityConfig()
+
+    # Allowed: substring 'sudo' in 'test_sudoku_solver' must NOT trigger prohibited command error
+    allowed_cmd = validate_command(["pytest", "-k", "test_sudoku_solver"], sec)
+    assert allowed_cmd == ["pytest", "-k", "test_sudoku_solver"]
+
+    # Blocked: direct prohibited command 'sudo'
+    with pytest.raises(ExecutionSecurityError) as exc_info:
+        validate_command(["sudo", "rm", "-rf", "/"], sec)
+    assert "sudo" in str(exc_info.value)
+
+    # Blocked: python -c bypass hiding prohibited command
+    with pytest.raises(ExecutionSecurityError) as exc_info:
+        validate_command(["python3", "-c", "import os; os.system('sudo shutdown')"], sec)
+    assert "forbidden command" in str(exc_info.value).lower()
+
+
+def test_probe_c5_bounded_output_and_children_killed(tmp_path: Path):
+    """Streaming output capture truncates runaway output and terminates process group (C5)."""
+    from amaura.config import BudgetConfig
+    script = tmp_path / "flood.py"
+    script.write_text(
+        "import sys\n"
+        "for _ in range(50000):\n"
+        "    sys.stdout.write('X' * 1000 + '\\n')\n"
+        "    sys.stdout.flush()\n"
+    )
+    bud = BudgetConfig(max_output_capture_bytes=10000)
+    res = run_safe_process([sys.executable, str(script)], cwd=tmp_path, budget_config=bud)
+    assert len(res.stdout) <= 15000
+    assert "[TRUNCATED" in res.stdout or len(res.stdout) <= 10000
+
+
+def test_probe_c6_symlink_loop_and_host_link_ignored(tmp_path: Path):
+    """Isolated workspace drops circular symlinks and links resolving outside workspace (C6)."""
+    from amaura.security.workspace import isolated_workspace
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "real.py").write_text("print('hello')")
+
+    host_target = Path("/etc")
+    if host_target.exists():
+        (source / "link_host").symlink_to(host_target)
+
+    (source / "link_loop").symlink_to(source)
+
+    with isolated_workspace(source) as ws:
+        assert (ws / "real.py").is_file()
+        assert not (ws / "link_host").exists()
+        assert not (ws / "link_loop").exists()
+
+
+def test_probe_c7_sandbox_home_cleaned(tmp_path: Path):
+    """Temporary sandbox_home is randomly named and unlinked on completion (C7)."""
+    script = tmp_path / "get_home.py"
+    script.write_text("import os; print('SANDBOX_HOME=' + os.environ['HOME'])")
+    res = run_safe_process([sys.executable, str(script)], cwd=tmp_path)
+    assert res.exit_code == 0
+    home_path = None
+    for line in res.stdout.splitlines():
+        if line.startswith("SANDBOX_HOME="):
+            home_path = Path(line.split("=", 1)[1].strip())
+            break
+    assert home_path is not None
+    assert "amaura_sandbox_" in home_path.name
+    assert not home_path.exists()
+
+
+def test_probe_c8_xml_bomb_and_entity_rejected(tmp_path: Path):
+    """safe_parse_xml rejects XML entities, DTD declarations, and oversized XML files (C8)."""
+    from amaura.security.xml import safe_parse_xml
+
+    # 1. Valid XML parses cleanly
+    valid_xml = tmp_path / "valid.xml"
+    valid_xml.write_text("<testsuites tests='1'><testsuite tests='1'/></testsuites>")
+    root = safe_parse_xml(valid_xml)
+    assert root.tag == "testsuites"
+
+    # 2. XML with DOCTYPE entity expansion is rejected
+    entity_xml = tmp_path / "entity.xml"
+    entity_xml.write_text(
+        "<?xml version='1.0'?>\n"
+        "<!DOCTYPE test [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]>\n"
+        "<testsuite>&xxe;</testsuite>"
+    )
+    with pytest.raises(ExecutionSecurityError) as exc_info:
+        safe_parse_xml(entity_xml)
+    assert "security violation" in str(exc_info.value).lower() or "dtd" in str(exc_info.value).lower()
+
+
+def test_probe_c9_path_within_workspace_enforced(tmp_path: Path):
+    """Verifiers and workspace operations enforce validate_path_within_workspace (C9)."""
+    from amaura.security.workspace import validate_path_within_workspace
+    from amaura.verifiers.code import CodeVerifier
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    inside = ws / "module.py"
+    inside.write_text("def ok(): pass")
+
+    outside = tmp_path / "outside.py"
+    outside.write_text("def secret(): pass")
+
+    assert validate_path_within_workspace(inside, ws) == inside.resolve()
+
+    with pytest.raises(ExecutionSecurityError) as exc_info:
+        validate_path_within_workspace(outside, ws)
+    assert "Path traversal detected" in str(exc_info.value)
+
+    chk = CheckDefinition(
+        check_id="chk_c9",
+        name="Path Check",
+        check_type=CheckType.BUILD,
+        metadata={"target_file": str(outside)},
+    )
+    collector = EvidenceCollector("run_c9")
+    with pytest.raises(ExecutionSecurityError):
+        CodeVerifier().verify(ws, chk, collector)
+
+
+def test_probe_c10_pythonpath_virtualenv_stripped_and_forbidden_vars(tmp_path: Path):
+    """PYTHONPATH and VIRTUAL_ENV are stripped from environment, and forbidden vars rejected (C10)."""
+    orig_pp = os.environ.get("PYTHONPATH")
+    orig_ve = os.environ.get("VIRTUAL_ENV")
+
+    os.environ["PYTHONPATH"] = "/injected/untrusted/pythonpath"
+    os.environ["VIRTUAL_ENV"] = "/injected/untrusted/venv"
+    try:
+        script = tmp_path / "env_check.py"
+        script.write_text(
+            "import os\n"
+            "print('VE=' + str(os.environ.get('VIRTUAL_ENV')))\n"
+            "print('PP=' + str(os.environ.get('PYTHONPATH')))\n"
+        )
+        res = run_safe_process([sys.executable, str(script)], cwd=tmp_path)
+        assert "VE=None" in res.stdout
+        assert "/injected/untrusted/pythonpath" not in res.stdout
+
+        sec = SecurityConfig(forbidden_env_vars=["FORBIDDEN_API_KEY"])
+        with pytest.raises(ExecutionSecurityError) as exc_info:
+            run_safe_process(
+                [sys.executable, str(script)],
+                cwd=tmp_path,
+                env={"FORBIDDEN_API_KEY": "secret_val"},
+                security_config=sec,
+            )
+        assert "Forbidden environment variable" in str(exc_info.value)
+    finally:
+        if orig_pp is not None:
+            os.environ["PYTHONPATH"] = orig_pp
+        else:
+            os.environ.pop("PYTHONPATH", None)
+
+        if orig_ve is not None:
+            os.environ["VIRTUAL_ENV"] = orig_ve
+        else:
+            os.environ.pop("VIRTUAL_ENV", None)
+
 

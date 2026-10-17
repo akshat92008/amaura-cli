@@ -9,6 +9,7 @@ from amaura.evidence.collector import EvidenceCollector
 from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus
 from amaura.models.evidence import EvidenceType
 from amaura.models.finding import Finding, FindingSeverity, FindingType
+from amaura.security.workspace import validate_path_within_workspace
 from amaura.verifiers.base import BaseVerifier, VerifierResult
 
 
@@ -44,6 +45,7 @@ class CitationVerifier(BaseVerifier):
 
         # 1. Discover all defined references
         for f in doc_files:
+            validate_path_within_workspace(f, project_dir)
             try:
                 content = f.read_text(encoding="utf-8", errors="ignore")
                 for key in bib_key_pattern.findall(content):

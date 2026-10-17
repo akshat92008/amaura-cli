@@ -10,6 +10,7 @@ from amaura.evidence.collector import EvidenceCollector
 from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus
 from amaura.models.evidence import EvidenceType
 from amaura.models.finding import Finding, FindingSeverity, FindingType
+from amaura.security.workspace import validate_path_within_workspace
 from amaura.verifiers.base import BaseVerifier, VerifierResult
 
 
@@ -36,6 +37,7 @@ class ExperimentVerifier(BaseVerifier):
 
         # 1. Check for unseeded random operations
         for pf in py_files:
+            validate_path_within_workspace(pf, project_dir)
             try:
                 content = pf.read_text(encoding="utf-8")
                 tree = ast.parse(content, filename=str(pf))

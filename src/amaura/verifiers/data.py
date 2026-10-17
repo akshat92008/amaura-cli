@@ -9,6 +9,7 @@ from amaura.evidence.collector import EvidenceCollector
 from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus
 from amaura.models.evidence import EvidenceType
 from amaura.models.finding import Finding, FindingSeverity, FindingType
+from amaura.security.workspace import validate_path_within_workspace
 from amaura.verifiers.base import BaseVerifier, VerifierResult
 
 
@@ -31,6 +32,7 @@ class DataVerifier(BaseVerifier):
         all_passed = True
 
         for cf in csv_files:
+            validate_path_within_workspace(cf, project_dir)
             try:
                 with open(cf, "r", encoding="utf-8", errors="replace") as f:
                     reader = csv.reader(f)
