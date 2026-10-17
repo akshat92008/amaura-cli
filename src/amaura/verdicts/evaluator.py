@@ -50,20 +50,22 @@ class VerdictEvaluator:
         if not checks or not executions:
             overall = OverallVerdict.FAILED if self.policy.profile == PolicyProfile.STRICT else OverallVerdict.INCONCLUSIVE
             reasons.append("Zero verification checks executed. An empty check suite cannot establish requirement satisfaction.")
-            updated_claims = [Claim.model_validate(c.model_dump()) for c in claims]
-            for uc in updated_claims:
+            early_claims = [Claim.model_validate(c.model_dump()) for c in claims]
+            for uc in early_claims:
                 uc.status = ClaimStatus.NOT_CHECKED
                 uc.limitations.append("No verification checks executed.")
                 unverified.append(uc.text)
-            return VerdictResult(overall, reasons, updated_claims, unverified)
+            return VerdictResult(overall, reasons, early_claims, unverified)
 
         exec_map: dict[str, CheckExecution] = {e.check_id: e for e in executions}
         check_map: dict[str, CheckDefinition] = {c.check_id: c for c in checks}
 
-        # 1. Identify defects and execution statuses
-        critical_defects = [
+        # 1. Identify critical/blocking findings across all finding types (defects, security risks, contradictions, unmet requirements)
+        critical_blocking_findings = [
             f for f in findings
-            if f.finding_type == FindingType.DEFECT and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH)
+            if (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.is_blocking)
+            or f.severity == FindingSeverity.CRITICAL
+            or (f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK) and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH))
         ]
         gap_findings = [
             f for f in findings
@@ -116,7 +118,9 @@ class VerdictEvaluator:
             ]
             claim_defects = [
                 f for f in claim_findings
-                if f.finding_type == FindingType.DEFECT and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH)
+                if (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.is_blocking)
+                or f.severity == FindingSeverity.CRITICAL
+                or (f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK) and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH))
             ]
             claim_gaps = [
                 f for f in claim_findings
@@ -165,12 +169,12 @@ class VerdictEvaluator:
 
         # Case A: Critical failures, failed mandatory checks, or contradicted claims
         any_claim_contradicted = any(c.status == ClaimStatus.CONTRADICTED for c in updated_claims)
-        if failed_mandatory_checks or critical_defects or any_claim_contradicted:
+        if failed_mandatory_checks or critical_blocking_findings or any_claim_contradicted:
             overall = OverallVerdict.FAILED
             for chk_name in failed_mandatory_checks:
                 reasons.append(f"Mandatory verification check failed: '{chk_name}'")
-            for f in critical_defects:
-                reasons.append(f"Critical defect: {f.title} ({f.description[:120]})")
+            for f in critical_blocking_findings:
+                reasons.append(f"Critical finding ({f.finding_type.value}): {f.title} ({f.description[:120]})")
             if any_claim_contradicted and not reasons:
                 reasons.append("One or more claims were contradicted by observed evidence.")
 

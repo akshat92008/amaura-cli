@@ -54,8 +54,11 @@ class TaskSpec(BaseModel):
         self.frozen = True
         return self
 
-    def verify_hash(self) -> bool:
-        """Verifies that the task content has not been tampered with or altered since freezing."""
+    def verify_hash(self, expected_hash: str | None = None) -> bool:
+        """Verifies that the task content matches an expected hash or has not been altered since freezing."""
+        computed = self.compute_hash()
+        if expected_hash:
+            return computed == expected_hash
         if not self.task_hash:
             return False
-        return self.compute_hash() == self.task_hash
+        return computed == self.task_hash

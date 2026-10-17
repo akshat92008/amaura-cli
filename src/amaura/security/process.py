@@ -3,6 +3,7 @@
 import os
 import signal
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -64,14 +65,20 @@ def run_safe_process(
     # 1. Enforce strict environment allowlist
     clean_env: dict[str, str] = {}
     for var_name in SAFE_ENV_ALLOWLIST:
-        if var_name in os.environ:
+        if var_name in os.environ and var_name not in ("HOME", "USERPROFILE"):
             clean_env[var_name] = os.environ[var_name]
 
     # Ensure minimal working PATH if stripped
     if "PATH" not in clean_env:
         clean_env["PATH"] = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
-    # Enforce offline behavior flags and proxy dead-ends when network is disabled
+    # Isolate HOME to prevent untrusted code from reading caller credentials (e.g. ~/.aws, ~/.ssh)
+    sandbox_home = Path(tempfile.gettempdir()) / f"amaura_sandbox_home_{os.getpid()}"
+    sandbox_home.mkdir(parents=True, exist_ok=True)
+    clean_env["HOME"] = str(sandbox_home.resolve())
+    clean_env["USERPROFILE"] = str(sandbox_home.resolve())
+
+    # Enforce offline behavior flags, proxy dead-ends, and socket connect interception when network is disabled
     if sec.privacy_mode.value == "local_only" or not sec.allow_network:
         # Direct all HTTP/HTTPS requests to an invalid local port to fail fast
         clean_env["http_proxy"] = "http://127.0.0.1:0"
@@ -83,6 +90,20 @@ def run_safe_process(
         clean_env["NO_PROXY"] = ""
         clean_env["PIP_NO_INDEX"] = "1"
         clean_env["PIP_OFFLINE"] = "1"
+
+        # Inject socket blocking hook for python processes
+        guard_file = sandbox_home / "sitecustomize.py"
+        guard_code = (
+            "import socket\n"
+            "_orig_connect = socket.socket.connect\n"
+            "def _blocked_connect(self, address):\n"
+            "    raise PermissionError('Amaura Security Policy: Network connection is strictly prohibited in local_only mode.')\n"
+            "socket.socket.connect = _blocked_connect\n"
+        )
+        guard_file.write_text(guard_code, encoding="utf-8")
+        clean_env["PYTHONSTARTUP"] = str(guard_file.resolve())
+        existing_pp = clean_env.get("PYTHONPATH", "")
+        clean_env["PYTHONPATH"] = f"{sandbox_home.resolve()}:{existing_pp}" if existing_pp else str(sandbox_home.resolve())
 
     if env:
         clean_env.update(env)

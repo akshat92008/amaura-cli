@@ -29,6 +29,10 @@ SECRET_PATTERNS: list[tuple[str, Pattern]] = [
         ),
     ),
     (
+        "AWS_SECRET_KEY",
+        re.compile(r"(?i)(?:aws_secret_access_key|aws_secret_key)\s*[:=]\s*['\"]?([a-zA-Z0-9/+=]{20,})['\"]?"),
+    ),
+    (
         "GENERIC_CREDENTIAL",
         re.compile(
             r"(?i)(?:access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pwd)"
@@ -45,7 +49,7 @@ def redact_secrets(text: str) -> str:
 
     sanitized = text
     for secret_type, pattern in SECRET_PATTERNS:
-        if secret_type in ("DATABASE_URL_PASSWORD", "BEARER_TOKEN", "GENERIC_API_KEY", "GENERIC_CREDENTIAL"):
+        if secret_type in ("DATABASE_URL_PASSWORD", "BEARER_TOKEN", "GENERIC_API_KEY", "GENERIC_CREDENTIAL", "AWS_SECRET_KEY"):
             def repl(m: re.Match, st: str = secret_type) -> str:
                 full = m.group(0)
                 val = m.group(1)

@@ -7,16 +7,19 @@ from pathlib import Path
 import pytest
 
 from amaura.agents.registry import AgentRegistry
-from amaura.config import AmauraConfig, VerificationPolicyConfig
-from amaura.errors import AdapterError, EvidenceIntegrityError, VerificationError
+from amaura.config import AmauraConfig, PrivacyMode, SecurityConfig, VerificationPolicyConfig
+from amaura.errors import AdapterError, EvidenceIntegrityError, TaskSpecificationError, VerificationError
 from amaura.evidence.collector import EvidenceCollector
 from amaura.evidence.ledger import EvidenceLedger
-from amaura.models.check import CheckDefinition, CheckType
+from amaura.models.check import CheckDefinition, CheckExecution, CheckStatus, CheckType
 from amaura.models.claim import Claim, ClaimStatus, ClaimType
+from amaura.models.finding import Finding, FindingSeverity, FindingType
 from amaura.models.run import OverallVerdict
 from amaura.models.task import Requirement, TaskSpec
 from amaura.orchestration.runner import verify_project
+from amaura.planning.requirements import load_task_file
 from amaura.security.process import run_safe_process
+from amaura.security.redaction import redact_secrets
 from amaura.verdicts.evaluator import VerdictEvaluator
 from amaura.verdicts.policy import VerdictPolicy
 from amaura.verifiers.code import CodeVerifier
@@ -276,3 +279,233 @@ def test_probe_task_spec_freeze_and_verify_hash():
     # Tamper with criteria
     task.acceptance_criteria.append("Tampered criteria")
     assert task.verify_hash() is False
+
+
+def test_probe_non_defect_blocking_finding_fails_run():
+    """Any critical or blocking finding (SECURITY_RISK, CONTRADICTION, UNMET_REQUIREMENT)
+    must fail the run even if tests pass and claims are nominally supported.
+    """
+    policy = VerdictPolicy(VerificationPolicyConfig())
+    evaluator = VerdictEvaluator(policy)
+    req = Requirement(id="REQ-01", description="Valid parsing", mandatory=True)
+    task = TaskSpec(task_id="t1", instruction="Parse", requirements=[req]).freeze()
+    claim = Claim(
+        claim_id="clm_1",
+        text="Everything works",
+        claim_type=ClaimType.BEHAVIORAL,
+        target_requirement_id="REQ-01",
+        status=ClaimStatus.SUPPORTED,
+    )
+    check = CheckDefinition(
+        check_id="chk_1",
+        check_type=CheckType.TEST,
+        verifier_name="code",
+        name="Test Check",
+        description="Run tests",
+    )
+    # Blocking security risk finding
+    security_finding = Finding(
+        finding_id="find_sec_1",
+        check_id="chk_1",
+        title="Hostile Conftest Hook Detected",
+        description="Malicious conftest attempts to forge test report",
+        finding_type=FindingType.SECURITY_RISK,
+        severity=FindingSeverity.CRITICAL,
+        is_blocking=True,
+    )
+    execution = CheckExecution(
+        execution_id="exec_1",
+        check_id="chk_1",
+        status=CheckStatus.PASSED,
+        exit_code=0,
+    )
+    result = evaluator.evaluate(
+        task=task,
+        claims=[claim],
+        checks=[check],
+        executions=[execution],
+        findings=[security_finding],
+    )
+    assert result.overall_verdict == OverallVerdict.FAILED
+    assert any("Critical finding (security_risk)" in r for r in result.verdict_reasons)
+
+
+def test_probe_hostile_conftest_reporting_hooks_detected(tmp_path: Path):
+    """Hostile conftest.py hooking pytest reporting or execution functions must be flagged as critical security risks."""
+    code_file = tmp_path / "app.py"
+    code_file.write_text("def run():\n    return True\n")
+    test_file = tmp_path / "test_app.py"
+    test_file.write_text("def test_run():\n    assert True\n")
+    conftest_file = tmp_path / "conftest.py"
+    conftest_file.write_text(
+        "def pytest_runtest_makereport(item, call):\n"
+        "    pass\n"
+    )
+    task_file = tmp_path / "task.md"
+    task_file.write_text(
+        "# Task\n## Requirements\n- REQ-001: Execute run function\n"
+    )
+
+    record = verify_project(project_dir=tmp_path, task_file=task_file)
+    assert record.overall_verdict == OverallVerdict.FAILED
+    assert any(f.finding_type == FindingType.SECURITY_RISK for f in record.findings)
+    assert any("Adversarial Test Harness Manipulation Detected" in f.title for f in record.findings)
+
+
+def test_probe_placeholder_test_caught_by_mutation_testing(tmp_path: Path):
+    """A placeholder test like assert len('ab') == 2 that does not exercise the code
+    must be caught when mutations survive, failing verification.
+    """
+    code_file = tmp_path / "calculator.py"
+    code_file.write_text(
+        "def subtract(a, b):\n"
+        "    return a - b\n"
+    )
+    test_file = tmp_path / "test_calculator.py"
+    test_file.write_text(
+        "# Placeholder test named for requirement that does not test subtract\n"
+        "def test_subtract():\n"
+        "    assert len('ab') == 2\n"
+    )
+    task_file = tmp_path / "task.md"
+    task_file.write_text(
+        "# Task: Math\n## Requirements\n- REQ-001: Subtract numbers correctly\n"
+    )
+
+    record = verify_project(project_dir=tmp_path, task_file=task_file)
+    assert record.overall_verdict == OverallVerdict.FAILED
+    assert any("Placeholder Test Detected: Mutant Survived" in f.title for f in record.findings)
+
+
+def test_probe_untrusted_project_task_and_config_ignored(tmp_path: Path):
+    """verify_project must ignore task.md and amaura.toml placed inside untrusted project_dir."""
+    # Untrusted project has a malicious task.md with REQ-002 deleted
+    untrusted_task = tmp_path / "task.md"
+    untrusted_task.write_text(
+        "# Malicious Task\n## Requirements\n- REQ-001: Valid parsing\n"
+    )
+    untrusted_config = tmp_path / "amaura.toml"
+    untrusted_config.write_text(
+        "[security]\nredact_secrets = false\n"
+    )
+
+    # Legitimate caller task has both REQ-001 and REQ-002
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    caller_task = caller_dir / "task.md"
+    caller_task.write_text(
+        "# Legitimate Task\n## Requirements\n- REQ-001: Valid parsing\n- REQ-002: Subtraction works\n"
+    )
+
+    # Project only implements valid parsing
+    (tmp_path / "calc.py").write_text("def parse(s): return s\n")
+    (tmp_path / "test_calc.py").write_text("from calc import parse\ndef test_parse(): assert parse('a') == 'a'\n")
+
+    record = verify_project(project_dir=tmp_path, task_file=caller_task)
+    # Must fail or be inconclusive because REQ-002 is not satisfied (caller task enforced!)
+    assert record.overall_verdict in (OverallVerdict.FAILED, OverallVerdict.INCONCLUSIVE)
+    req_ids = [r.id for r in record.task.requirements]
+    assert "REQ-002" in req_ids
+
+
+def test_probe_expected_hash_tamper_detection(tmp_path: Path):
+    """load_task_file must reject a modified task file when expected_hash is specified."""
+    task_file = tmp_path / "task.md"
+    task_file.write_text(
+        "# Task\n## Requirements\n- REQ-001: First requirement\n"
+    )
+    # Legitimate hash
+    spec = load_task_file(task_file)
+    valid_hash = spec.task_hash
+
+    # Caller passes valid hash -> succeeds
+    loaded = load_task_file(task_file, expected_hash=valid_hash)
+    assert loaded.task_hash == valid_hash
+
+    # Tamper with file
+    task_file.write_text(
+        "# Task\n## Requirements\n- REQ-001: Tampered requirement\n"
+    )
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        load_task_file(task_file, expected_hash=valid_hash)
+    assert "Task specification hash mismatch" in str(exc_info.value)
+
+
+def test_probe_offline_socket_connect_blocked():
+    """In local_only mode, raw socket connect attempts must be intercepted and rejected."""
+    sec = SecurityConfig(privacy_mode=PrivacyMode.LOCAL_ONLY, allow_network=False)
+    res = run_safe_process(
+        command=[
+            "python3",
+            "-c",
+            "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.connect(('8.8.8.8', 53))\n",
+        ],
+        cwd=Path.cwd(),
+        security_config=sec,
+    )
+    # Must fail due to PermissionError or connection failure
+    assert res.exit_code != 0
+    assert "PermissionError" in res.stderr or "prohibited" in res.stderr.lower() or "network" in res.stderr.lower()
+
+
+def test_probe_isolated_home_prevents_credential_access(tmp_path: Path):
+    """Untrusted code must not be able to read sensitive credentials from the host $HOME directory."""
+    # Create fake credential file in host HOME
+    host_home = Path(os.environ["HOME"])
+    fake_cred = host_home / ".probe_cloud_credentials"
+    fake_cred.write_text("SUPER_SECRET_USER_CREDENTIALS")
+
+    try:
+        res = run_safe_process(
+            command=[
+                "python3",
+                "-c",
+                "from pathlib import Path\ncred = Path.home() / '.probe_cloud_credentials'\nprint('EXISTS' if cred.is_file() else 'ISOLATED')\n",
+            ],
+            cwd=tmp_path,
+        )
+        assert res.exit_code == 0
+        assert res.stdout.strip() == "ISOLATED"
+    finally:
+        if fake_cred.is_file():
+            fake_cred.unlink()
+
+
+def test_probe_aws_secret_key_redacted():
+    """AWS secret access keys must be redacted from outputs."""
+    raw_text = "aws_secret_access_key=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY and db connected."
+    redacted = redact_secrets(raw_text)
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in redacted
+    assert "[REDACTED_AWS_SECRET_KEY]" in redacted
+
+
+def test_probe_edit_and_recalculate_ledger_attack_detected(tmp_path: Path):
+    """An adversary modifies run.json AND recalculates run.sha256.
+    The immutable ledger_chain.jsonl hash chain must catch the tampering.
+    """
+    import hashlib
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+    run_id = record.run_id
+
+    # Adversary attack: modify run.json AND recalculate run.sha256
+    run_json = runs_dir / run_id / "run.json"
+    data = json.loads(run_json.read_text(encoding="utf-8"))
+    data["overall_verdict"] = "failed"
+    new_content = json.dumps(data, indent=2)
+    run_json.write_text(new_content, encoding="utf-8")
+
+    # Recalculate run.sha256 to match the tampered run.json
+    new_hash = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+    (runs_dir / run_id / "run.sha256").write_text(f"{new_hash}  run.json\n", encoding="utf-8")
+
+    # Loading the run must still detect the tampering via ledger_chain.jsonl!
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.load_run(run_id)
+    assert "does not match the immutable ledger chain" in str(exc_info.value)

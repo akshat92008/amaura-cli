@@ -60,21 +60,103 @@ class EvidenceLedger:
 
         # 4. Generate cryptographic tamper-evident checksum
         checksum_file = run_dir / "run.sha256"
-        checksum_file.write_text(hash_string(json_content), encoding="utf-8")
+        run_hash = hash_string(json_content)
+        checksum_file.write_text(run_hash, encoding="utf-8")
 
-        # 5. Save markdown report if provided
+        # 5. Record into immutable ledger hash chain
+        self._append_to_chain(record.run_id, run_hash)
+
+        # 6. Save markdown report if provided
         if report_markdown:
             report_file = run_dir / "report.md"
             report_file.write_text(report_markdown, encoding="utf-8")
 
-        # 6. Update latest pointer
+        # 7. Update latest pointer
         latest_pointer = self.runs_dir / "latest.txt"
         latest_pointer.write_text(record.run_id, encoding="utf-8")
 
         return run_dir
 
+    @property
+    def chain_file(self) -> Path:
+        return self.runs_dir / "ledger_chain.jsonl"
+
+    def _append_to_chain(self, run_id: str, run_hash: str) -> None:
+        """Appends a new block to the cryptographic hash chain linking all runs."""
+        prev_hash = "0" * 64
+        index = 0
+        if self.chain_file.is_file():
+            lines = [line.strip() for line in self.chain_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if lines:
+                try:
+                    last_block = json.loads(lines[-1])
+                    prev_hash = last_block.get("block_hash", prev_hash)
+                    index = last_block.get("index", 0) + 1
+                except Exception:
+                    pass
+
+        from datetime import UTC, datetime
+        timestamp = datetime.now(UTC).isoformat()
+        payload = f"{index}:{run_id}:{run_hash}:{prev_hash}:{timestamp}"
+        block_hash = hash_string(payload)
+        block = {
+            "index": index,
+            "run_id": run_id,
+            "run_hash": run_hash,
+            "prev_hash": prev_hash,
+            "timestamp": timestamp,
+            "block_hash": block_hash,
+        }
+        with open(self.chain_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(block) + "\n")
+
+    def _verify_chain_for_run(self, run_id: str, actual_hash: str) -> list[str]:
+        """Validates the entire hash chain and ensures the run's recorded hash matches."""
+        errors: list[str] = []
+        if not self.chain_file.is_file():
+            return errors
+
+        lines = [line.strip() for line in self.chain_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+        expected_prev = "0" * 64
+        run_recorded_hash = None
+
+        for i, line in enumerate(lines):
+            try:
+                block = json.loads(line)
+            except Exception as e:
+                errors.append(f"TAMPER DETECTED: Corrupted block {i} in ledger chain: {e!s}")
+                return errors
+
+            idx = block.get("index", i)
+            b_run_id = block.get("run_id", "")
+            b_run_hash = block.get("run_hash", "")
+            b_prev = block.get("prev_hash", "")
+            b_time = block.get("timestamp", "")
+            b_hash = block.get("block_hash", "")
+
+            if b_prev != expected_prev:
+                errors.append(
+                    f"TAMPER DETECTED: Broken hash chain link at block {i} (expected prev {expected_prev[:12]}..., got {b_prev[:12]}...)"
+                )
+
+            computed_block_hash = hash_string(f"{idx}:{b_run_id}:{b_run_hash}:{b_prev}:{b_time}")
+            if computed_block_hash != b_hash:
+                errors.append(f"TAMPER DETECTED: Forged block hash at block {i}")
+
+            expected_prev = b_hash
+            if b_run_id == run_id:
+                run_recorded_hash = b_run_hash
+
+        if run_recorded_hash is not None and run_recorded_hash != actual_hash:
+            errors.append(
+                f"TAMPER DETECTED: run.json does not match the immutable ledger chain! "
+                f"(Chain recorded {run_recorded_hash[:12]}..., but run file is {actual_hash[:12]}...)"
+            )
+
+        return errors
+
     def verify_run_integrity(self, run_dir: Path) -> tuple[bool, list[str]]:
-        """Verifies that run.json and evidence files match their cryptographic SHA-256 checksums."""
+        """Verifies that run.json, evidence files, and ledger chain match their cryptographic SHA-256 checksums."""
         discrepancies: list[str] = []
         run_json_file = run_dir / "run.json"
         checksum_file = run_dir / "run.sha256"
@@ -82,13 +164,18 @@ class EvidenceLedger:
         if not run_json_file.is_file():
             return False, ["run.json is missing"]
 
+        actual_hash = hash_file(run_json_file)
         if checksum_file.is_file():
             expected_hash = checksum_file.read_text(encoding="utf-8").strip()
-            actual_hash = hash_file(run_json_file)
             if expected_hash != actual_hash:
                 discrepancies.append(
                     f"TAMPER DETECTED: run.json checksum mismatch (expected {expected_hash[:12]}..., got {actual_hash[:12]}...)"
                 )
+
+        # Check against master ledger hash chain (catches edit-and-recompute attacks!)
+        if self.chain_file.is_file():
+            chain_errors = self._verify_chain_for_run(run_dir.name, actual_hash)
+            discrepancies.extend(chain_errors)
 
         # Check evidence artifacts
         try:

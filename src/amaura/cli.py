@@ -1,6 +1,7 @@
 """Amaura CLI — An evidence-first reliability layer for AI agents."""
 
 import platform
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -160,11 +161,12 @@ def agents():
 def verify(
     path: Path = typer.Argument(Path("."), help="Path to project directory to verify"),
     task: Optional[Path] = typer.Option(None, "--task", "-t", help="Path to task specification file"),
+    expected_hash: Optional[str] = typer.Option(None, "--expected-hash", help="Expected SHA-256 hash of task specification"),
     profile: Optional[PolicyProfile] = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
     no_network: bool = typer.Option(True, "--no-network/--allow-network", help="Enforce local-only isolated execution"),
 ):
     """Run applicable checks on existing work."""
-    cfg = AmauraConfig.load(start_dir=path)
+    cfg = AmauraConfig.load(start_dir=Path.cwd())
     if no_network:
         cfg.security.allow_network = False
         cfg.security.privacy_mode = PrivacyMode.LOCAL_ONLY
@@ -173,6 +175,7 @@ def verify(
         record = verify_project(
             project_dir=path,
             task_file=task,
+            expected_hash=expected_hash,
             policy_profile=profile,
             config=cfg,
         )
@@ -190,12 +193,13 @@ def verify(
 def audit(
     path: Path = typer.Argument(Path("."), help="Path to project to audit"),
     task: Optional[Path] = typer.Option(None, "--task", "-t", help="Path to task specification file"),
+    expected_hash: Optional[str] = typer.Option(None, "--expected-hash", help="Expected SHA-256 hash of task specification"),
     format: str = typer.Option("text", "--format", "-f", help="Output format: text, json, or markdown"),
 ):
     """Audit completed work without assuming it is trustworthy (strictly non-destructive)."""
-    cfg = AmauraConfig.load(start_dir=path)
+    cfg = AmauraConfig.load(start_dir=Path.cwd())
     try:
-        record = audit_project(project_dir=path, task_file=task, config=cfg)
+        record = audit_project(project_dir=path, task_file=task, expected_hash=expected_hash, config=cfg)
         if format == "json":
             console.print(generate_json_report(record))
         elif format == "markdown":
@@ -415,13 +419,18 @@ def benchmark(
 def run(
     task: Path = typer.Argument(..., help="Path to task markdown file"),
     agent: str = typer.Option("artifact_only", "--agent", "-a", help="Agent adapter to operate"),
+    agent_cmd: Optional[str] = typer.Option(None, "--agent-cmd", help="CLI command to execute when using local_cli agent"),
+    expected_hash: Optional[str] = typer.Option(None, "--expected-hash", help="Expected SHA-256 hash of task specification"),
     profile: Optional[PolicyProfile] = typer.Option(None, "--profile", "-p", help="Verification policy profile"),
 ):
     """Execute an agent workflow in an isolated workspace and verify the output."""
     try:
+        agent_command = shlex.split(agent_cmd) if agent_cmd else None
         record = run_and_verify(
             task_file=task,
             agent_name=agent,
+            agent_command=agent_command,
+            expected_hash=expected_hash,
             policy_profile=profile,
         )
         _print_run_summary(record)

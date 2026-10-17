@@ -1,8 +1,9 @@
-"""Execution orchestrator providing isolated execution, non-destructive audits, and tamper validation."""
+"""High-level runner APIs orchestrating verification, claim checks, and agent runs."""
 
 from pathlib import Path
 from typing import Optional
 
+from amaura.agents.adapters.local_cli import LocalCLIAdapter
 from amaura.agents.registry import AgentRegistry
 from amaura.config import AmauraConfig, PolicyProfile
 from amaura.errors import ExecutionSecurityError
@@ -15,28 +16,36 @@ from amaura.planning.requirements import load_task_file, parse_markdown_task
 from amaura.security.workspace import isolated_workspace
 
 
-def find_or_create_default_task(project_dir: Path) -> TaskSpec:
-    """Attempts to discover task.md or generates default task specification."""
+def find_or_create_default_task(project_dir: Path, caller_dir: Optional[Path] = None) -> TaskSpec:
+    """Discovers task.md from caller_dir or generates an immutable strict default task specification.
+    Never blindly trusts task.md discovered inside the untrusted project directory!
+    """
+    search_dir = caller_dir or Path.cwd()
     for candidate_name in ["task.md", "TASK.md", "requirements.md"]:
-        candidate = project_dir / candidate_name
+        candidate = search_dir / candidate_name
         if candidate.is_file():
             return load_task_file(candidate)
 
-    default_text = f"# Task: Verify {project_dir.name}\n\n## Requirements\n- Ensure code compiles and passes tests."
+    default_text = f"# Task: Verify {project_dir.name}\n\n## Requirements\n- Ensure all tests pass without failures or unhandled crashes."
     return parse_markdown_task(default_text, filename="default_task.md")
 
 
 def verify_project(
     project_dir: Path,
     task_file: Optional[Path] = None,
+    expected_hash: Optional[str] = None,
     policy_profile: Optional[PolicyProfile] = None,
     config: Optional[AmauraConfig] = None,
 ) -> RunRecord:
     """Runs verification on a project directory inside an isolated disposable workspace."""
-    cfg = config or AmauraConfig.load(start_dir=project_dir)
+    cfg = config or AmauraConfig.load(start_dir=Path.cwd())
     pipeline = VerificationPipeline(cfg)
 
-    task = load_task_file(task_file) if task_file else find_or_create_default_task(project_dir)
+    task = (
+        load_task_file(task_file, expected_hash=expected_hash)
+        if task_file
+        else find_or_create_default_task(project_dir, caller_dir=Path.cwd())
+    )
 
     # Always execute checks in an isolated disposable copy to prevent mutating the original
     with isolated_workspace(project_dir) as ws:
@@ -51,15 +60,20 @@ def verify_project(
 def audit_project(
     project_dir: Path,
     task_file: Optional[Path] = None,
+    expected_hash: Optional[str] = None,
     config: Optional[AmauraConfig] = None,
 ) -> RunRecord:
     """Audits existing completed work non-destructively in an isolated workspace,
     strictly verifying that the audited directory remains completely untouched.
     """
-    cfg = config or AmauraConfig.load(start_dir=project_dir)
+    cfg = config or AmauraConfig.load(start_dir=Path.cwd())
     pipeline = VerificationPipeline(cfg)
 
-    task = load_task_file(task_file) if task_file else find_or_create_default_task(project_dir)
+    task = (
+        load_task_file(task_file, expected_hash=expected_hash)
+        if task_file
+        else find_or_create_default_task(project_dir, caller_dir=Path.cwd())
+    )
 
     # Snapshot original project directory manifest before audit
     initial_manifest = create_directory_manifest(project_dir)
@@ -88,11 +102,11 @@ def check_claims(
 ) -> RunRecord:
     """Verifies explicit claims from a claims file against a project."""
     target_dir = (project_dir or Path.cwd()).resolve()
-    cfg = config or AmauraConfig.load(start_dir=target_dir)
+    cfg = config or AmauraConfig.load(start_dir=Path.cwd())
     pipeline = VerificationPipeline(cfg)
 
     claims = load_claims_file(claims_file)
-    task = find_or_create_default_task(target_dir)
+    task = find_or_create_default_task(target_dir, caller_dir=Path.cwd())
 
     with isolated_workspace(target_dir) as ws:
         return pipeline.run(
@@ -106,17 +120,21 @@ def check_claims(
 def run_and_verify(
     task_file: Path,
     agent_name: str = "artifact_only",
+    agent_command: Optional[list[str]] = None,
+    expected_hash: Optional[str] = None,
     project_dir: Optional[Path] = None,
     policy_profile: Optional[PolicyProfile] = None,
     config: Optional[AmauraConfig] = None,
 ) -> RunRecord:
     """Executes an agent in an isolated workspace, then independently verifies output."""
     base_dir = (project_dir or Path.cwd()).resolve()
-    cfg = config or AmauraConfig.load(start_dir=base_dir)
-    task = load_task_file(task_file)
+    cfg = config or AmauraConfig.load(start_dir=Path.cwd())
+    task = load_task_file(task_file, expected_hash=expected_hash)
 
     agent_registry = AgentRegistry()
     adapter = agent_registry.get(agent_name)  # Will raise AdapterError on unknown name
+    if isinstance(adapter, LocalCLIAdapter) and agent_command:
+        adapter.cli_command = agent_command
 
     with isolated_workspace(base_dir) as ws:
         # Run agent
@@ -131,7 +149,8 @@ def run_and_verify(
             policy_override=policy_profile,
         )
 
-        # Record agent execution metadata into record
+        # Record agent execution metadata into record and re-persist to disk
         record.limitations.append(f"Agent '{agent_name}' result: success={agent_res.success}")
+        pipeline.ledger.save_run(record)
 
     return record

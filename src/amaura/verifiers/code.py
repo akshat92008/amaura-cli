@@ -1,6 +1,7 @@
 """Code verification engine supporting AST quality checks, independent JUnit parsing, and rigorous acceptance tests."""
 
 import ast
+import copy
 import re
 import sys
 import tempfile
@@ -89,6 +90,133 @@ def inspect_test_function_assertions(func_node: ast.FunctionDef | ast.AsyncFunct
                     valid_asserts += 1
 
     return valid_asserts, vacuous_asserts, is_skipped
+
+
+def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
+    """Inspects any conftest.py files to detect hostile reporting and exit status manipulation."""
+    violations: list[str] = []
+    hostile_hooks = {
+        "pytest_sessionfinish",
+        "pytest_runtest_makereport",
+        "pytest_runtest_logreport",
+        "pytest_report_teststatus",
+        "pytest_pyfunc_call",
+    }
+    for cf in project_dir.rglob("conftest.py"):
+        if any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in cf.parts):
+            continue
+        try:
+            cf_tree = ast.parse(cf.read_text(encoding="utf-8"), filename=str(cf))
+            for node in ast.walk(cf_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name in hostile_hooks:
+                        violations.append(f"{cf.name}::{node.name}")
+                elif isinstance(node, ast.Attribute):
+                    if node.attr in ("exitstatus", "outcome"):
+                        violations.append(f"{cf.name} modifies attribute '{node.attr}'")
+        except Exception:
+            pass
+    return violations
+
+
+def generate_candidate_mutants(source: str, max_mutants: int = 5) -> list[str]:
+    """Generates candidate mutant source strings using targeted fault injection:
+    1. Invert/replace Return statements (return None)
+    2. Replace function bodies with a fault (raise RuntimeError)
+    3. Invert Comparison operators (== <-> !=, in <-> not in, < <-> >=, etc.)
+    4. Invert Boolean constants (True <-> False)
+    """
+    try:
+        base_tree = ast.parse(source)
+    except Exception:
+        return []
+
+    mutants: list[str] = []
+
+    # 1. Mutate Return statements to return None
+    for node in ast.walk(base_tree):
+        if len(mutants) >= max_mutants:
+            break
+        if isinstance(node, ast.Return) and node.value is not None:
+            if isinstance(node.value, ast.Constant) and node.value.value is None:
+                continue
+            new_tree = copy.deepcopy(base_tree)
+            for sub in ast.walk(new_tree):
+                if isinstance(sub, ast.Return) and getattr(sub, "lineno", None) == getattr(node, "lineno", None):
+                    sub.value = ast.Constant(value=None)
+                    try:
+                        mutants.append(ast.unparse(new_tree))
+                    except Exception:
+                        pass
+                    break
+
+    # 2. Mutate function bodies to raise RuntimeError
+    for node in ast.walk(base_tree):
+        if len(mutants) >= max_mutants:
+            break
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            new_tree = copy.deepcopy(base_tree)
+            for sub in ast.walk(new_tree):
+                if isinstance(sub, type(node)) and sub.name == node.name and getattr(sub, "lineno", None) == getattr(node, "lineno", None):
+                    err_node = ast.Raise(
+                        exc=ast.Call(
+                            func=ast.Name(id="RuntimeError", ctx=ast.Load()),
+                            args=[ast.Constant(value="Amaura mutation fault injection")],
+                            keywords=[],
+                        )
+                    )
+                    sub.body = [err_node]
+                    try:
+                        mutants.append(ast.unparse(new_tree))
+                    except Exception:
+                        pass
+                    break
+
+    # 3. Mutate comparisons
+    comp_map = {
+        ast.Eq: ast.NotEq,
+        ast.NotEq: ast.Eq,
+        ast.In: ast.NotIn,
+        ast.NotIn: ast.In,
+        ast.Lt: ast.GtE,
+        ast.Gt: ast.LtE,
+        ast.LtE: ast.Gt,
+        ast.GtE: ast.Lt,
+        ast.Is: ast.IsNot,
+        ast.IsNot: ast.Is,
+    }
+    for node in ast.walk(base_tree):
+        if len(mutants) >= max_mutants:
+            break
+        if isinstance(node, ast.Compare) and len(node.ops) > 0:
+            op_type = type(node.ops[0])
+            if op_type in comp_map:
+                new_tree = copy.deepcopy(base_tree)
+                for sub in ast.walk(new_tree):
+                    if isinstance(sub, ast.Compare) and getattr(sub, "lineno", None) == getattr(node, "lineno", None):
+                        sub.ops[0] = comp_map[op_type]()
+                        try:
+                            mutants.append(ast.unparse(new_tree))
+                        except Exception:
+                            pass
+                        break
+
+    # 4. Mutate boolean constants
+    for node in ast.walk(base_tree):
+        if len(mutants) >= max_mutants:
+            break
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            new_tree = copy.deepcopy(base_tree)
+            for sub in ast.walk(new_tree):
+                if isinstance(sub, ast.Constant) and isinstance(sub.value, bool) and getattr(sub, "lineno", None) == getattr(node, "lineno", None):
+                    sub.value = not sub.value
+                    try:
+                        mutants.append(ast.unparse(new_tree))
+                    except Exception:
+                        pass
+                    break
+
+    return mutants
 
 
 class CodeVerifier(BaseVerifier):
@@ -217,6 +345,20 @@ class CodeVerifier(BaseVerifier):
                 "addopts=",
             ]
 
+            conftest_violations = detect_adversarial_conftest_hooks(project_dir)
+            if conftest_violations:
+                findings.append(
+                    Finding(
+                        finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                        check_id=check.check_id,
+                        title="Adversarial Test Harness Manipulation Detected",
+                        description=f"Hostile test hook(s) detected in conftest.py: {', '.join(conftest_violations)}. Test harness cannot be trusted.",
+                        finding_type=FindingType.SECURITY_RISK,
+                        severity=FindingSeverity.CRITICAL,
+                        is_blocking=True,
+                    )
+                )
+
             proc_res = run_safe_process(
                 command=cmd,
                 cwd=project_dir,
@@ -234,8 +376,8 @@ class CodeVerifier(BaseVerifier):
 
             if junit_xml.is_file():
                 try:
-                    tree = ET.parse(junit_xml)
-                    root = tree.getroot()
+                    xml_tree = ET.parse(junit_xml)
+                    root = xml_tree.getroot()
                     # Root can be <testsuites> or <testsuite>
                     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
                     for s in suites:
@@ -341,8 +483,8 @@ class CodeVerifier(BaseVerifier):
 
         for tf in test_files:
             try:
-                tree = ast.parse(tf.read_text(encoding="utf-8"), filename=str(tf))
-                for node in ast.walk(tree):
+                ast_tree = ast.parse(tf.read_text(encoding="utf-8"), filename=str(tf))
+                for node in ast.walk(ast_tree):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         # Only inspect actual test functions, not helper functions
                         if node.name.startswith("test_"):
@@ -441,9 +583,17 @@ class CodeVerifier(BaseVerifier):
             desc_clean = desc_clean[len(boilerplate_prefix):].strip()
 
         # Extract specific distinctive domain keywords from requirement description
-        # Reject generic stop words: valid, validates, requirement, satisfaction, check, test, ensure
+        # Reject generic stop words: valid, validates, requirement, satisfaction, check, test, ensure, works, integers, data, records, inputs, etc.
         words = re.findall(r"\b[a-zA-Z]{3,}\b", desc_clean)
-        stop_words = {"validates", "requirement", "satisfaction", "ensure", "check", "test", "should", "must", "with", "from", "into"}
+        stop_words = {
+            "validates", "requirement", "satisfaction", "ensure", "check", "test", "should", "must",
+            "with", "from", "into", "works", "work", "integers", "integer", "number", "numbers",
+            "string", "strings", "input", "inputs", "output", "outputs", "data", "records", "record",
+            "file", "files", "item", "items", "value", "values", "correct", "proper", "properly",
+            "handling", "handles", "safely", "safe", "without", "support", "supports", "function",
+            "module", "system", "feature", "type", "types", "case", "cases", "each", "both", "clean",
+            "cleanly", "table", "tabular", "parse", "parsing", "identifies", "identify",
+        }
         distinctive_keywords = [w for w in words if w not in stop_words]
 
         test_files = [
@@ -458,25 +608,63 @@ class CodeVerifier(BaseVerifier):
 
         for tf in test_files:
             try:
-                tree = ast.parse(tf.read_text(encoding="utf-8"), filename=str(tf))
-                for node in ast.walk(tree):
+                ast_tree = ast.parse(tf.read_text(encoding="utf-8"), filename=str(tf))
+                for node in ast.walk(ast_tree):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                         if node.name.startswith("test_"):
                             name_lower = node.name.lower()
-                            # 1. Match by exact requirement ID (e.g. test_req_001)
-                            if req_id_slug and req_id_slug in name_lower:
+                            doc = ast.get_docstring(node) or ""
+                            doc_lower = doc.lower()
+
+                            # 1. Match by exact requirement ID (e.g. test_req_001, docstring 'REQ-001')
+                            if req_id_slug and (req_id_slug in name_lower or req_id.lower() in doc_lower):
                                 matched_test_funcs.append(node.name)
                                 continue
 
                             # 2. Match by distinctive keywords from description
-                            # Must match a specific domain keyword (e.g. duplicate, malformed, subtract)
-                            matched_kw = [kw for kw in distinctive_keywords if kw in name_lower]
+                            matched_kw = [kw for kw in distinctive_keywords if kw in name_lower or kw in doc_lower]
                             if matched_kw:
                                 matched_test_funcs.append(node.name)
             except Exception:
                 pass
 
         findings: list[Finding] = []
+
+        # Check for adversarial conftest hooks attempting to hijack outcomes
+        conftest_violations = detect_adversarial_conftest_hooks(project_dir)
+        if conftest_violations:
+            status = CheckStatus.FAILED
+            msg = f"Hostile test hook(s) detected in conftest.py: {', '.join(conftest_violations)}. Test harness cannot be trusted."
+            execution = CheckExecution(
+                execution_id=exec_id,
+                check_id=check.check_id,
+                status=status,
+                stdout=msg,
+                exit_code=1,
+                end_time=datetime.now(UTC).isoformat(),
+            )
+            ev = collector.add_evidence(
+                check_id=check.check_id,
+                content=msg,
+                evidence_type=EvidenceType.AST_ANALYSIS,
+                claim_id=check.target_claim_id,
+                source="conftest_security_scanner",
+                method="ast_inspection",
+            )
+            findings.append(
+                Finding(
+                    finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                    check_id=check.check_id,
+                    claim_id=check.target_claim_id,
+                    title="Adversarial Test Harness Manipulation Detected",
+                    description=msg,
+                    finding_type=FindingType.SECURITY_RISK,
+                    severity=FindingSeverity.CRITICAL,
+                    evidence_ids=[ev.evidence_id],
+                    is_blocking=True,
+                )
+            )
+            return VerifierResult(check_id=check.check_id, execution=execution, evidence=[ev], findings=findings)
 
         # If no tests match the requirement, report requirement coverage gap!
         if not matched_test_funcs:
@@ -546,8 +734,8 @@ class CodeVerifier(BaseVerifier):
             total_ran = 0
             if junit_xml.is_file():
                 try:
-                    tree = ET.parse(junit_xml)
-                    root = tree.getroot()
+                    xml_tree = ET.parse(junit_xml)
+                    root = xml_tree.getroot()
                     suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
                     for s in suites:
                         total_ran += int(s.attrib.get("tests", 0))
@@ -561,6 +749,69 @@ class CodeVerifier(BaseVerifier):
                 status = CheckStatus.TIMED_OUT
             elif failures > 0 or errors > 0 or proc_res.exit_code != 0 or total_ran == 0:
                 status = CheckStatus.FAILED
+
+            # Mutation Testing: If test passed, verify that injecting defects into source code causes test failure.
+            # This completely defeats placeholder tests (e.g. assert len("ab") == 2) and conftest outcome forgers.
+            if status == CheckStatus.PASSED:
+                py_src_files = [
+                    p for p in project_dir.rglob("*.py")
+                    if not (p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py")
+                    and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
+                ]
+                mutant_tested = False
+                mutant_killed = False
+
+                for src_p in py_src_files:
+                    if mutant_killed:
+                        break
+                    original_code = src_p.read_text(encoding="utf-8")
+                    candidates = generate_candidate_mutants(original_code, max_mutants=5)
+                    for mutated_code in candidates:
+                        mutant_tested = True
+                        try:
+                            src_p.write_text(mutated_code, encoding="utf-8")
+                            m_res = run_safe_process(
+                                command=cmd,
+                                cwd=project_dir,
+                                timeout_seconds=check.timeout_seconds,
+                                security_config=self.config.security,
+                                budget_config=self.config.budget,
+                            )
+                            m_failed = m_res.exit_code != 0
+                            if junit_xml.is_file():
+                                try:
+                                    m_tree = ET.parse(junit_xml)
+                                    m_root = m_tree.getroot()
+                                    m_suites = [m_root] if m_root.tag == "testsuite" else list(m_root.findall("testsuite"))
+                                    for s in m_suites:
+                                        if int(s.attrib.get("failures", 0)) > 0 or int(s.attrib.get("errors", 0)) > 0:
+                                            m_failed = True
+                                except Exception:
+                                    pass
+
+                            if m_failed:
+                                mutant_killed = True
+                                break
+                        finally:
+                            src_p.write_text(original_code, encoding="utf-8")
+
+                if mutant_tested and not mutant_killed:
+                    status = CheckStatus.FAILED
+                    findings.append(
+                        Finding(
+                            finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                            check_id=check.check_id,
+                            claim_id=check.target_claim_id,
+                            title=f"Placeholder Test Detected: Mutant Survived ({req_id})",
+                            description=(
+                                f"Acceptance test for '{req_id}' ({k_filter}) passed even after mutating source code. "
+                                f"The test assertions do not depend on the implementation logic or the harness is forged."
+                            ),
+                            finding_type=FindingType.TEST_GAP,
+                            severity=FindingSeverity.CRITICAL,
+                            is_blocking=True,
+                        )
+                    )
 
             execution = CheckExecution(
                 execution_id=exec_id,
@@ -583,7 +834,7 @@ class CodeVerifier(BaseVerifier):
                 method="targeted_execution",
             )
 
-            if status != CheckStatus.PASSED:
+            if status != CheckStatus.PASSED and not findings:
                 findings.append(
                     Finding(
                         finding_id=f"find_{uuid.uuid4().hex[:8]}",
