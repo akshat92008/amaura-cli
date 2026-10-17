@@ -23,7 +23,7 @@ class EvidenceCollector:
         claim_id: str | None = None,
         source: str = "execution_runner",
         method: str = "subprocess_capture",
-        independent: bool = True,
+        independent: bool = False,
         limitations: list[str] | None = None,
     ) -> EvidenceItem:
         """Creates and indexes a new EvidenceItem."""

@@ -58,7 +58,7 @@ class VerificationPipeline:
 
         # 4. Plan verification checks
         planner = VerificationPlan(task, effective_claims)
-        checks = planner.plan_code_project_checks(project_dir)
+        checks = planner.plan_checks(project_dir)
         for chk in checks:
             graph.add_check(chk)
 

@@ -10,7 +10,7 @@ from amaura.models.evidence import Provenance
 def build_provenance(
     source: str,
     method: str,
-    independent: bool = True,
+    independent: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> Provenance:
     """Builds a rich Provenance record recording platform, Python version, tool metadata and timestamp."""

@@ -2,15 +2,15 @@
 
 import csv
 import io
+from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel, Field
 
-
-class ImportResult(BaseModel):
+@dataclass
+class ImportResult:
     success: bool
-    records: list[dict[str, Any]] = Field(default_factory=list)
-    errors: list[str] = Field(default_factory=list)
+    records: list[dict[str, Any]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def import_csv(content: str) -> ImportResult:

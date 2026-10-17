@@ -60,12 +60,12 @@ class VerdictEvaluator:
         exec_map: dict[str, CheckExecution] = {e.check_id: e for e in executions}
         check_map: dict[str, CheckDefinition] = {c.check_id: c for c in checks}
 
-        # 1. Identify critical/blocking findings across all finding types (defects, security risks, contradictions, unmet requirements)
+        # 1. Identify critical/blocking findings across defects, security risks, and contradictions
+        # NOTE: VERIFICATION_GAP and TEST_GAP represent untested/insufficient evidence, NOT defects or contradictions.
         critical_blocking_findings = [
             f for f in findings
-            if (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.is_blocking)
-            or f.severity == FindingSeverity.CRITICAL
-            or (f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK) and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH))
+            if f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK)
+            and (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) or f.is_blocking)
         ]
         gap_findings = [
             f for f in findings
@@ -73,7 +73,11 @@ class VerdictEvaluator:
         ]
 
         failed_mandatory_checks: list[str] = []
-        timed_out_checks: list[str] = []
+        failed_non_mandatory_checks: list[str] = []
+        timed_out_mandatory_checks: list[str] = []
+        timed_out_non_mandatory_checks: list[str] = []
+        error_mandatory_checks: list[str] = []
+        error_non_mandatory_checks: list[str] = []
         missing_mandatory_checks: list[str] = []
 
         for check in checks:
@@ -84,11 +88,18 @@ class VerdictEvaluator:
             elif exec_item.status == CheckStatus.FAILED:
                 if check.mandatory:
                     failed_mandatory_checks.append(check.name)
+                else:
+                    failed_non_mandatory_checks.append(check.name)
             elif exec_item.status == CheckStatus.TIMED_OUT:
-                timed_out_checks.append(check.name)
+                if check.mandatory:
+                    timed_out_mandatory_checks.append(check.name)
+                else:
+                    timed_out_non_mandatory_checks.append(check.name)
             elif exec_item.status == CheckStatus.ERROR:
                 if check.mandatory:
-                    failed_mandatory_checks.append(check.name)
+                    error_mandatory_checks.append(check.name)
+                else:
+                    error_non_mandatory_checks.append(check.name)
 
         # 2. Update individual Claim statuses based on dedicated acceptance checks
         updated_claims: list[Claim] = []
@@ -118,9 +129,8 @@ class VerdictEvaluator:
             ]
             claim_defects = [
                 f for f in claim_findings
-                if (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) and f.is_blocking)
-                or f.severity == FindingSeverity.CRITICAL
-                or (f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK) and f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH))
+                if f.finding_type in (FindingType.DEFECT, FindingType.CONTRADICTION, FindingType.SECURITY_RISK)
+                and (f.severity in (FindingSeverity.CRITICAL, FindingSeverity.HIGH) or f.is_blocking)
             ]
             claim_gaps = [
                 f for f in claim_findings
@@ -165,41 +175,53 @@ class VerdictEvaluator:
             updated_claims.append(claim_copy)
 
         # 3. Formulate overall verdict with fail-closed rules
-        # Precedence: FAILED > INCONCLUSIVE > PASSED
+        # Precedence: FAILED > INCONCLUSIVE > SUPPORTED_WITH_LIMITATIONS > PASSED
 
-        # Case A: Critical failures, failed mandatory checks, or contradicted claims
         any_claim_contradicted = any(c.status == ClaimStatus.CONTRADICTED for c in updated_claims)
-        if failed_mandatory_checks or critical_blocking_findings or any_claim_contradicted:
+
+        # Case A: Critical failures, failed mandatory checks, mandatory errors, or contradicted claims
+        if failed_mandatory_checks or error_mandatory_checks or critical_blocking_findings or any_claim_contradicted:
             overall = OverallVerdict.FAILED
             for chk_name in failed_mandatory_checks:
                 reasons.append(f"Mandatory verification check failed: '{chk_name}'")
+            for chk_name in error_mandatory_checks:
+                reasons.append(f"Mandatory verification check encountered fatal error: '{chk_name}'")
             for f in critical_blocking_findings:
                 reasons.append(f"Critical finding ({f.finding_type.value}): {f.title} ({f.description[:120]})")
             if any_claim_contradicted and not reasons:
                 reasons.append("One or more claims were contradicted by observed evidence.")
 
         # Case B: Timed out mandatory checks (fail-closed)
-        elif timed_out_checks:
+        elif timed_out_mandatory_checks:
             overall = OverallVerdict.FAILED
-            for chk_name in timed_out_checks:
+            for chk_name in timed_out_mandatory_checks:
                 reasons.append(f"Mandatory check exceeded budget and timed out: '{chk_name}'")
 
-        # Case C: Missing mandatory checks or untested requirement gaps
-        elif missing_mandatory_checks or gap_findings:
-            if self.policy.profile == PolicyProfile.STRICT:
-                overall = OverallVerdict.FAILED
-                if missing_mandatory_checks:
-                    reasons.append(f"Strict policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
-                for g in gap_findings:
-                    reasons.append(f"Strict policy failure: {g.title} - {g.description[:120]}")
-            else:
-                overall = OverallVerdict.INCONCLUSIVE
-                if missing_mandatory_checks:
-                    reasons.append(f"Mandatory checks were not executed: {', '.join(missing_mandatory_checks)}")
-                for g in gap_findings:
-                    reasons.append(f"Verification gap: {g.title} - {g.description[:120]}")
+        # Case C: Strict policy failure for gaps or non-mandatory issues
+        elif self.policy.profile == PolicyProfile.STRICT and (
+            missing_mandatory_checks or gap_findings or failed_non_mandatory_checks or error_non_mandatory_checks or timed_out_non_mandatory_checks
+        ):
+            overall = OverallVerdict.FAILED
+            if missing_mandatory_checks:
+                reasons.append(f"Strict policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
+            for g in gap_findings:
+                reasons.append(f"Strict policy failure: {g.title} - {g.description[:120]}")
+            for chk in failed_non_mandatory_checks:
+                reasons.append(f"Strict policy failure: Non-mandatory check failed: '{chk}'")
+            for chk in error_non_mandatory_checks:
+                reasons.append(f"Strict policy failure: Non-mandatory check error: '{chk}'")
+            for chk in timed_out_non_mandatory_checks:
+                reasons.append(f"Strict policy failure: Non-mandatory check timed out: '{chk}'")
 
-        # Case D: Claims check: all claims corresponding to mandatory requirements must be SUPPORTED
+        # Case D: Missing mandatory checks or untested requirement gaps (Default/Permissive -> INCONCLUSIVE)
+        elif missing_mandatory_checks or gap_findings:
+            overall = OverallVerdict.INCONCLUSIVE
+            if missing_mandatory_checks:
+                reasons.append(f"Mandatory checks were not executed: {', '.join(missing_mandatory_checks)}")
+            for g in gap_findings:
+                reasons.append(f"Verification gap: {g.title} - {g.description[:120]}")
+
+        # Case E: Unverified claims remaining
         elif any(c.status in (ClaimStatus.INCONCLUSIVE, ClaimStatus.NOT_CHECKED) for c in updated_claims):
             inconclusive_claims = [c.text for c in updated_claims if c.status in (ClaimStatus.INCONCLUSIVE, ClaimStatus.NOT_CHECKED)]
             if self.policy.profile == PolicyProfile.STRICT:
@@ -209,7 +231,32 @@ class VerdictEvaluator:
                 overall = OverallVerdict.INCONCLUSIVE
                 reasons.append(f"Unverified claims remaining: {'; '.join(inconclusive_claims[:3])}")
 
-        # Case E: All passed cleanly
+        # Case F: Non-mandatory errors, failures, or timeouts in PERMISSIVE mode
+        elif failed_non_mandatory_checks or error_non_mandatory_checks or timed_out_non_mandatory_checks:
+            if self.policy.profile == PolicyProfile.PERMISSIVE:
+                overall = OverallVerdict.SUPPORTED_WITH_LIMITATIONS
+                reasons.append("All mandatory requirements supported; non-mandatory warnings or timeouts observed under permissive policy.")
+                for chk in failed_non_mandatory_checks:
+                    reasons.append(f"Limitation: Non-mandatory check failed: '{chk}'")
+                for chk in timed_out_non_mandatory_checks:
+                    reasons.append(f"Limitation: Non-mandatory check timed out: '{chk}'")
+                for chk in error_non_mandatory_checks:
+                    reasons.append(f"Limitation: Non-mandatory check error: '{chk}'")
+            else:
+                overall = OverallVerdict.INCONCLUSIVE
+                for chk in error_non_mandatory_checks:
+                    reasons.append(f"Non-mandatory check error: '{chk}'")
+                for chk in timed_out_non_mandatory_checks:
+                    reasons.append(f"Non-mandatory check timed out: '{chk}'")
+                for chk in failed_non_mandatory_checks:
+                    reasons.append(f"Non-mandatory check failed: '{chk}'")
+
+        # Case G: Minor findings or limitations present on supported claims
+        elif any(c.limitations for c in updated_claims) or any(f.severity in (FindingSeverity.LOW, FindingSeverity.MEDIUM) for f in findings):
+            overall = OverallVerdict.SUPPORTED_WITH_LIMITATIONS
+            reasons.append("All mandatory requirements supported with documented limitations.")
+
+        # Case H: Clean pass
         else:
             overall = OverallVerdict.PASSED
             reasons.append("All mandatory acceptance and quality checks passed with supporting evidence.")

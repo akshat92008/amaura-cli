@@ -509,3 +509,129 @@ def test_probe_edit_and_recalculate_ledger_attack_detected(tmp_path: Path):
     with pytest.raises(EvidenceIntegrityError) as exc_info:
         ledger.load_run(run_id)
     assert "does not match the immutable ledger chain" in str(exc_info.value)
+
+
+def test_probe_unmapped_bogus_claim_cannot_be_supported(tmp_path: Path):
+    """An adversary makes an ungrounded claim outside task requirements ('The system runs on Mars').
+    The system must NOT silently mark it SUPPORTED without evidence (A11).
+    """
+    from amaura.orchestration.runner import check_claims
+
+    # Create dummy project
+    code_file = tmp_path / "app.py"
+    code_file.write_text("def run():\n    return 'local'\n")
+
+    test_file = tmp_path / "test_app.py"
+    test_file.write_text("from app import run\ndef test_run():\n    assert run() == 'local'\n")
+
+    claims_file = tmp_path / "claims.yaml"
+    claims_file.write_text(
+        "claims:\n"
+        "  - claim_id: CLM-BOGUS-01\n"
+        "    text: The application runs natively on Mars surface\n"
+        "    importance: critical\n"
+    )
+
+    record = check_claims(claims_file=claims_file, project_dir=tmp_path)
+    # The bogus claim must NOT be SUPPORTED
+    bogus_claim = next(c for c in record.claims if c.claim_id == "CLM-BOGUS-01")
+    assert bogus_claim.status != ClaimStatus.SUPPORTED
+    assert record.overall_verdict in (OverallVerdict.FAILED, OverallVerdict.INCONCLUSIVE)
+
+
+def test_probe_contradicted_arithmetic_claim_detected(tmp_path: Path):
+    """An adversary includes false calculations (e.g. 10 + 20 = 50).
+    The calculation verifier must detect the arithmetic contradiction and fail (A13).
+    """
+    doc_file = tmp_path / "report.md"
+    doc_file.write_text("# Report\n\nTotal sum: 10 + 20 = 50 according to verified metrics.\n")
+
+    code_file = tmp_path / "main.py"
+    code_file.write_text("print('hello')\n")
+
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# Task\n## Requirements\n- REQ-001: Report metrics\n")
+
+    check = CheckDefinition(
+        check_id="chk_calc_test",
+        name="Calculation Check",
+        check_type=CheckType.RECALCULATION,
+        verifier_name="calculations",
+    )
+    from amaura.verifiers.calculations import CalculationVerifier
+    verifier = CalculationVerifier(AmauraConfig())
+    collector = EvidenceCollector("run_calc_probe")
+    res = verifier.verify(tmp_path, check, collector)
+    assert res.execution.status == CheckStatus.FAILED
+    assert any(f.finding_type == FindingType.CONTRADICTION for f in res.findings)
+
+
+def test_probe_stdlib_constraint_enforced(tmp_path: Path):
+    """When a task specifies stdlib only, importing third-party libraries (e.g. requests)
+    must fail closed with an external dependency constraint violation (A8).
+    """
+    code_file = tmp_path / "script.py"
+    code_file.write_text("import requests\nprint(requests.__name__)\n")
+
+    task_file = tmp_path / "task.md"
+    task_file.write_text(
+        "# Task\n"
+        "## Requirements\n"
+        "- REQ-001: Script execution\n"
+        "## Constraints\n"
+        "- Standard library only. No external dependencies.\n"
+    )
+
+    record = verify_project(project_dir=tmp_path, task_file=task_file)
+    assert record.overall_verdict == OverallVerdict.FAILED
+    assert any("External Dependency Constraint Violated" in f.title for f in record.findings)
+
+
+def test_probe_dangling_citation_detected(tmp_path: Path):
+    """An adversary cites [NonExistent2024] without defining it in references.
+    The citation verifier must catch the dangling citation (A13).
+    """
+    doc_file = tmp_path / "paper.md"
+    doc_file.write_text(
+        "# Research Paper\n\n"
+        "As demonstrated by prior work [NonExistent2024], our algorithm is optimal.\n\n"
+        "## References\n"
+        "1. Smith, J. Real Paper (2020).\n"
+    )
+
+    check = CheckDefinition(
+        check_id="chk_cite_test",
+        name="Citation Check",
+        check_type=CheckType.CITATION_MATCH,
+        verifier_name="citations",
+    )
+    from amaura.verifiers.citations import CitationVerifier
+    verifier = CitationVerifier(AmauraConfig())
+    collector = EvidenceCollector("run_cite_probe")
+    res = verifier.verify(tmp_path, check, collector)
+    assert res.execution.status == CheckStatus.FAILED
+    assert any("Dangling In-Text Citations" in f.title for f in res.findings)
+
+
+def test_probe_unseeded_randomness_detected(tmp_path: Path):
+    """An experiment using stochastic operations without setting a seed must be flagged (A13)."""
+    script_file = tmp_path / "train.py"
+    script_file.write_text(
+        "import random\n\n"
+        "def split(data):\n"
+        "    return random.choice(data)\n"
+    )
+
+    check = CheckDefinition(
+        check_id="chk_exp_test",
+        name="Experiment Determinism Check",
+        check_type=CheckType.BENCHMARK,
+        verifier_name="experiments",
+    )
+    from amaura.verifiers.experiments import ExperimentVerifier
+    verifier = ExperimentVerifier(AmauraConfig())
+    collector = EvidenceCollector("run_exp_probe")
+    res = verifier.verify(tmp_path, check, collector)
+    assert res.execution.status == CheckStatus.FAILED
+    assert any("Unseeded Random Operations" in f.title for f in res.findings)
+

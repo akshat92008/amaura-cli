@@ -37,14 +37,14 @@ def is_trivial_comparison(node: ast.AST) -> bool:
 
 
 def inspect_test_function_assertions(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[int, int, bool]:
-    """Inspects a test function node for assertions, vacuous checks, pytest.raises, and skip decorators.
+    """Inspects a test function node for assertions, vacuous checks, pytest.raises, skips, and assertion delegation.
     Returns (valid_assert_count, vacuous_assert_count, is_skipped).
     """
     valid_asserts = 0
     vacuous_asserts = 0
     is_skipped = False
 
-    # 1. Check decorators for skip markers
+    # 1. Check decorators for skip / xfail markers
     for dec in func_node.decorator_list:
         dec_name = ""
         if isinstance(dec, ast.Name):
@@ -57,15 +57,38 @@ def inspect_test_function_assertions(func_node: ast.FunctionDef | ast.AsyncFunct
             elif isinstance(dec.func, ast.Name):
                 dec_name = dec.func.id
 
-        if "skip" in dec_name.lower():
+        if any(marker in dec_name.lower() for marker in ("skip", "xfail")):
             is_skipped = True
 
-    # 2. Walk AST for assertion constructs
+    # 2. Walk AST for assertion constructs, skips/xfails in body, and helper delegation
     for node in ast.walk(func_node):
+        # Check for pytest.skip() or pytest.xfail() called inside body
+        if isinstance(node, ast.Call):
+            call_name = ""
+            if isinstance(node.func, ast.Attribute):
+                call_name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                call_name = node.func.id
+            if call_name in ("skip", "xfail"):
+                is_skipped = True
+
         # assert statement
         if isinstance(node, ast.Assert):
-            if is_trivial_constant(node.test) or is_trivial_comparison(node.test):
+            # Check for vacuous asserts: tuple assert (x, "msg"), trivial constant (assert True), or trivial comparison (1==1)
+            if (
+                (isinstance(node.test, ast.Tuple) and len(node.test.elts) > 0)
+                or is_trivial_constant(node.test)
+                or is_trivial_comparison(node.test)
+            ):
                 vacuous_asserts += 1
+            # Check 4: assert x == x (comparing identical AST expressions)
+            elif isinstance(node.test, ast.Compare) and len(node.test.comparators) == 1:
+                left_dump = ast.dump(node.test.left)
+                right_dump = ast.dump(node.test.comparators[0])
+                if left_dump == right_dump and isinstance(node.test.ops[0], (ast.Eq, ast.Is)):
+                    vacuous_asserts += 1
+                else:
+                    valid_asserts += 1
             else:
                 valid_asserts += 1
 
@@ -83,40 +106,151 @@ def inspect_test_function_assertions(func_node: ast.FunctionDef | ast.AsyncFunct
                     if func_str in ("raises", "warns", "assertRaises", "assertWarns"):
                         valid_asserts += 1
 
-        # self.assert* call
+        # Calls to assertion methods or helper functions: self.assert*, assertTrue, assertEqual, check_*, verify_*
         elif isinstance(node, ast.Call):
+            call_name = ""
             if isinstance(node.func, ast.Attribute):
-                if node.func.attr.startswith("assert") and node.func.attr != "assert_":
+                call_name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                call_name = node.func.id
+
+            # unittest style assertions: self.assertTrue(True), self.assertEqual(x, x), etc.
+            if call_name.startswith("assert") and call_name != "assert_":
+                # Check for assertTrue(True) / assertFalse(False) or assertEqual(x, x)
+                is_vacuous_unit = (
+                    (call_name in ("assertTrue", "assertFalse") and len(node.args) >= 1 and is_trivial_constant(node.args[0]))
+                    or (call_name in ("assertEqual", "assertIs") and len(node.args) >= 2 and ast.dump(node.args[0]) == ast.dump(node.args[1]))
+                )
+                if is_vacuous_unit:
+                    vacuous_asserts += 1
+                else:
                     valid_asserts += 1
+            # Helper function delegation (e.g. check_result(...), verify_output(...), assert_valid(...))
+            elif any(prefix in call_name.lower() for prefix in ("check_", "verify_", "validate_", "ensure_")):
+                valid_asserts += 1
 
     return valid_asserts, vacuous_asserts, is_skipped
 
 
 def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
-    """Inspects any conftest.py files to detect hostile reporting and exit status manipulation."""
+    """Inspects any conftest.py or test configuration files to detect hostile reporting,
+    exit status manipulation, forced process exit, or report forging.
+    Avoids false-positives on benign inspection of report.outcome.
+    """
     violations: list[str] = []
-    hostile_hooks = {
-        "pytest_sessionfinish",
-        "pytest_runtest_makereport",
-        "pytest_runtest_logreport",
-        "pytest_report_teststatus",
-        "pytest_pyfunc_call",
-    }
+
+    # 1. Check for untrusted sitecustomize.py in project dir
+    sitecustom = project_dir / "sitecustomize.py"
+    if sitecustom.is_file():
+        violations.append(f"{sitecustom.name} detected in project root (potential interpreter hijack)")
+
+    # 2. Check for hostile pytest.ini or configuration options attempting to disable hooks or load external plugins
+    for ini_name in ["pytest.ini", "tox.ini", "setup.cfg"]:
+        ini_file = project_dir / ini_name
+        if ini_file.is_file():
+            try:
+                ini_content = ini_file.read_text(encoding="utf-8", errors="ignore")
+                if "-p " in ini_content or "plugins" in ini_content.lower():
+                    violations.append(f"{ini_name} specifies custom plugins or options")
+            except Exception:
+                pass
+
     for cf in project_dir.rglob("conftest.py"):
         if any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in cf.parts):
             continue
         try:
             cf_tree = ast.parse(cf.read_text(encoding="utf-8"), filename=str(cf))
             for node in ast.walk(cf_tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if node.name in hostile_hooks:
-                        violations.append(f"{cf.name}::{node.name}")
-                elif isinstance(node, ast.Attribute):
-                    if node.attr in ("exitstatus", "outcome"):
-                        violations.append(f"{cf.name} modifies attribute '{node.attr}'")
+                # Check for pytest_plugins declaration
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id == "pytest_plugins":
+                            violations.append(f"{cf.name} defines 'pytest_plugins' (unauthorized plugin loading)")
+
+                # Check for os._exit or sys.exit in conftest
+                elif isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Attribute) and node.func.attr in ("_exit", "exit"):
+                        violations.append(f"{cf.name} calls '{node.func.attr}' to hijack process termination")
+                    elif isinstance(node.func, ast.Name) and node.func.id in ("exit", "quit"):
+                        violations.append(f"{cf.name} calls '{node.func.id}' to hijack process termination")
+                    # Check for setattr(..., "outcome" / "exitstatus", ...)
+                    elif isinstance(node.func, ast.Name) and node.func.id == "setattr":
+                        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("outcome", "exitstatus"):
+                            attr_str = str(node.args[1].value)
+                            violations.append(f"{cf.name} modifies attribute '{attr_str}' via setattr")
+
+                # Check for direct write/store assignment to outcome or exitstatus (NOT benign reads)
+                elif isinstance(node, ast.Attribute) and node.attr in ("exitstatus", "outcome"):
+                    if isinstance(node.ctx, ast.Store):
+                        violations.append(f"{cf.name} overwrites attribute '{node.attr}'")
+
+                # Check for hooks that forge reports or outcomes
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if node.name in ("pytest_sessionfinish", "pytest_runtest_makereport", "pytest_runtest_logreport", "pytest_report_teststatus", "pytest_pyfunc_call"):
+                        # If the hook assigns to anything or modifies outcome/exitstatus
+                        for subnode in ast.walk(node):
+                            if isinstance(subnode, ast.Attribute) and subnode.attr in ("exitstatus", "outcome") and isinstance(subnode.ctx, ast.Store):
+                                violations.append(f"{cf.name}::{node.name} modifies '{subnode.attr}'")
+                                break
+                            elif isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Attribute) and subnode.func.attr in ("_exit", "exit"):
+                                violations.append(f"{cf.name}::{node.name} calls '{subnode.func.attr}'")
+                                break
+                        else:
+                            if node.name in ("pytest_runtest_makereport", "pytest_sessionfinish"):
+                                violations.append(f"{cf.name}::{node.name}")
+                    elif node.name in ("pytest_configure", "pytest_unconfigure"):
+                        for subnode in ast.walk(node):
+                            if isinstance(subnode, ast.Call):
+                                func = subnode.func
+                                if isinstance(func, ast.Attribute) and func.attr in ("_exit", "exit"):
+                                    violations.append(f"{cf.name}::{node.name} calls '{func.attr}'")
+                                    break
+                                elif isinstance(func, ast.Name) and func.id == "open":
+                                    if len(subnode.args) >= 2 and isinstance(subnode.args[1], ast.Constant) and "w" in str(subnode.args[1].value):
+                                        violations.append(f"{cf.name}::{node.name} writes to file (potential report tampering)")
+                                        break
+                                elif isinstance(func, ast.Attribute) and func.attr in ("write_text", "write_bytes"):
+                                    violations.append(f"{cf.name}::{node.name} writes to file (potential report tampering)")
+                                    break
         except Exception:
             pass
     return violations
+
+
+def find_imported_source_modules(test_files: list[Path], project_dir: Path) -> list[Path]:
+    """Finds project source files directly imported by the given test files."""
+    imported_files: set[Path] = set()
+    for tf in test_files:
+        try:
+            tree = ast.parse(tf.read_text(encoding="utf-8"), filename=str(tf))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top_mod = alias.name.split(".")[0]
+                        for cand in [
+                            tf.parent / f"{top_mod}.py",
+                            project_dir / f"{top_mod}.py",
+                            project_dir / "src" / f"{top_mod}.py",
+                            project_dir / top_mod / "__init__.py",
+                            project_dir / "src" / top_mod / "__init__.py",
+                        ]:
+                            if cand.is_file():
+                                imported_files.add(cand.resolve())
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        top_mod = node.module.split(".")[0]
+                        for cand in [
+                            tf.parent / f"{top_mod}.py",
+                            project_dir / f"{top_mod}.py",
+                            project_dir / "src" / f"{top_mod}.py",
+                            project_dir / top_mod / "__init__.py",
+                            project_dir / "src" / top_mod / "__init__.py",
+                        ]:
+                            if cand.is_file():
+                                imported_files.add(cand.resolve())
+        except Exception:
+            pass
+    return sorted(imported_files)
 
 
 def generate_candidate_mutants(source: str, max_mutants: int = 5) -> list[str]:
@@ -238,6 +372,8 @@ class CodeVerifier(BaseVerifier):
             return self._verify_test_quality(project_dir, check, collector)
         elif check.check_type == CheckType.ACCEPTANCE_TEST:
             return self._verify_acceptance(project_dir, check, collector)
+        elif check.check_type in (CheckType.LINT, CheckType.CONSTRAINT) or check.metadata.get("constraint"):
+            return self._verify_constraints(project_dir, check, collector)
         else:
             return self._verify_generic_command(project_dir, check, collector)
 
@@ -265,19 +401,28 @@ class CodeVerifier(BaseVerifier):
 
         findings: list[Finding] = []
         if not py_files:
-            status = CheckStatus.FAILED
-            stdout = "No Python source files found in project."
-            findings.append(
-                Finding(
-                    finding_id=f"find_{uuid.uuid4().hex[:8]}",
-                    check_id=check.check_id,
-                    title="Empty Project",
-                    description="No Python source files (.py) exist in the project directory to compile.",
-                    finding_type=FindingType.DEFECT,
-                    severity=FindingSeverity.CRITICAL,
-                    is_blocking=True,
+            # Check if other non-Python project files exist (e.g. JS, Rust, Go, Markdown, etc.)
+            other_project_files = [
+                p for p in project_dir.rglob("*")
+                if p.is_file() and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
+            ]
+            if other_project_files:
+                status = CheckStatus.PASSED
+                stdout = f"Non-Python project detected ({len(other_project_files)} files found). Python compilation skipped."
+            else:
+                status = CheckStatus.FAILED
+                stdout = "No project source files found in project directory."
+                findings.append(
+                    Finding(
+                        finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                        check_id=check.check_id,
+                        title="Empty Project",
+                        description="No source or project files exist in the project directory to build or compile.",
+                        finding_type=FindingType.DEFECT,
+                        severity=FindingSeverity.CRITICAL,
+                        is_blocking=True,
+                    )
                 )
-            )
         elif errors:
             status = CheckStatus.FAILED
             stdout = "\n".join(errors)
@@ -393,28 +538,30 @@ class CodeVerifier(BaseVerifier):
             status = CheckStatus.PASSED
             summary_reasons = []
 
-            if proc_res.timed_out:
+            if conftest_violations:
+                status = CheckStatus.FAILED
+                summary_reasons.append(f"Adversarial test harness manipulation detected: {', '.join(conftest_violations)}")
+            elif proc_res.timed_out:
                 status = CheckStatus.TIMED_OUT
                 summary_reasons.append("Test runner timed out.")
-            elif not xml_parsed and proc_res.exit_code != 0:
+            elif not xml_parsed:
                 status = CheckStatus.FAILED
-                summary_reasons.append(f"Test runner exited with code {proc_res.exit_code}.")
-            elif xml_parsed:
-                if total_tests == 0:
-                    status = CheckStatus.FAILED
-                    summary_reasons.append("No tests were discovered or executed.")
-                elif failures > 0 or errors > 0:
-                    status = CheckStatus.FAILED
-                    summary_reasons.append(f"Observed {failures} failure(s) and {errors} error(s) in test suite.")
-                elif skipped == total_tests:
-                    status = CheckStatus.FAILED
-                    summary_reasons.append(f"All {total_tests} test(s) were skipped. Zero active tests ran.")
-                elif proc_res.exit_code != 0:
-                    status = CheckStatus.FAILED
-                    summary_reasons.append(f"Process exited with code {proc_res.exit_code}.")
+                summary_reasons.append(
+                    f"Test runner report was missing or unparsable (exit code: {proc_res.exit_code}). "
+                    "Unverified test runs cannot be treated as passed."
+                )
+            elif total_tests == 0:
+                status = CheckStatus.FAILED
+                summary_reasons.append("No tests were discovered or executed.")
+            elif failures > 0 or errors > 0:
+                status = CheckStatus.FAILED
+                summary_reasons.append(f"Observed {failures} failure(s) and {errors} error(s) in test suite.")
+            elif skipped == total_tests:
+                status = CheckStatus.FAILED
+                summary_reasons.append(f"All {total_tests} test(s) were skipped. Zero active tests ran.")
             elif proc_res.exit_code != 0:
                 status = CheckStatus.FAILED
-                summary_reasons.append(f"Test runner exited with code {proc_res.exit_code}.")
+                summary_reasons.append(f"Process exited with non-zero code {proc_res.exit_code}.")
 
             stdout = proc_res.stdout
             if summary_reasons:
@@ -438,6 +585,7 @@ class CodeVerifier(BaseVerifier):
                 evidence_type=EvidenceType.TEST_OUTPUT,
                 source="test_runner",
                 method="pytest_junit_xml",
+                independent=False,
             )
 
             if status != CheckStatus.PASSED:
@@ -489,14 +637,14 @@ class CodeVerifier(BaseVerifier):
                         # Only inspect actual test functions, not helper functions
                         if node.name.startswith("test_"):
                             total_test_functions += 1
-                            valid_count, vacuous_count, is_skip = inspect_test_function_assertions(node)
+                            valid_count, _vacuous_count, is_skip = inspect_test_function_assertions(node)
 
                             if is_skip:
                                 skipped_tests.append(f"{tf.name}::{node.name}")
 
-                            if valid_count == 0 or vacuous_count > 0:
+                            if valid_count == 0:
                                 vacuous_tests.append(
-                                    f"{tf.name}::{node.name} (valid asserts: {valid_count}, vacuous: {vacuous_count})"
+                                    f"{tf.name}::{node.name} (zero valid assertions or checks)"
                                 )
             except Exception as e:
                 vacuous_tests.append(f"AST parse error in {tf.name}: {e!s}")
@@ -602,9 +750,17 @@ class CodeVerifier(BaseVerifier):
             and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
         ]
 
-        # Look for tests explicitly targeting this requirement by ID or distinctive keywords
+        # Look for tests explicitly targeting this requirement by ID, decorators, or primary domain concept
         matched_test_funcs: list[str] = []
+        matched_test_files: list[Path] = []
         req_id_slug = req_id.lower().replace("-", "_")
+
+        # Determine primary domain concept from requirement description (prevent unrelated keyword hijack)
+        primary_concept = None
+        for concept in ["duplicate", "malformed", "sensitive", "subtract", "addition", "division", "multiplication"]:
+            if concept in desc_clean:
+                primary_concept = concept
+                break
 
         for tf in test_files:
             try:
@@ -619,12 +775,30 @@ class CodeVerifier(BaseVerifier):
                             # 1. Match by exact requirement ID (e.g. test_req_001, docstring 'REQ-001')
                             if req_id_slug and (req_id_slug in name_lower or req_id.lower() in doc_lower):
                                 matched_test_funcs.append(node.name)
+                                matched_test_files.append(tf)
                                 continue
 
-                            # 2. Match by distinctive keywords from description
-                            matched_kw = [kw for kw in distinctive_keywords if kw in name_lower or kw in doc_lower]
-                            if matched_kw:
+                            # 2. Check for requirement decorator (e.g. @pytest.mark.requirement("REQ-001"))
+                            has_req_mark = False
+                            for dec in node.decorator_list:
+                                if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in ("requirement", "req"):
+                                    if len(dec.args) > 0 and isinstance(dec.args[0], ast.Constant) and str(dec.args[0].value).lower() == req_id.lower():
+                                        has_req_mark = True
+                            if has_req_mark:
                                 matched_test_funcs.append(node.name)
+                                matched_test_files.append(tf)
+                                continue
+
+                            # 3. Match by primary domain concept or compound keywords
+                            if primary_concept:
+                                if primary_concept in name_lower or primary_concept in doc_lower:
+                                    matched_test_funcs.append(node.name)
+                                    matched_test_files.append(tf)
+                            else:
+                                matched_kw = [kw for kw in distinctive_keywords if kw in name_lower or kw in doc_lower]
+                                if len(matched_kw) >= 2:
+                                    matched_test_funcs.append(node.name)
+                                    matched_test_files.append(tf)
             except Exception:
                 pass
 
@@ -758,10 +932,14 @@ class CodeVerifier(BaseVerifier):
                     if not (p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py")
                     and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
                 ]
+                # Target source files imported by the matching test suite
+                imported_src_files = find_imported_source_modules(matched_test_files, project_dir)
+                target_src_files = imported_src_files if imported_src_files else py_src_files
+
                 mutant_tested = False
                 mutant_killed = False
 
-                for src_p in py_src_files:
+                for src_p in target_src_files:
                     if mutant_killed:
                         break
                     original_code = src_p.read_text(encoding="utf-8")
@@ -769,6 +947,8 @@ class CodeVerifier(BaseVerifier):
                     for mutated_code in candidates:
                         mutant_tested = True
                         try:
+                            # CRUCIAL (A4): Unlink stale XML before each mutant run to prevent stale report reuse
+                            junit_xml.unlink(missing_ok=True)
                             src_p.write_text(mutated_code, encoding="utf-8")
                             m_res = run_safe_process(
                                 command=cmd,
@@ -777,7 +957,7 @@ class CodeVerifier(BaseVerifier):
                                 security_config=self.config.security,
                                 budget_config=self.config.budget,
                             )
-                            m_failed = m_res.exit_code != 0
+                            m_failed = m_res.exit_code != 0 or m_res.timed_out
                             if junit_xml.is_file():
                                 try:
                                     m_tree = ET.parse(junit_xml)
@@ -788,6 +968,9 @@ class CodeVerifier(BaseVerifier):
                                             m_failed = True
                                 except Exception:
                                     pass
+
+                            if "FAILED " in m_res.stdout or "ERROR " in m_res.stdout:
+                                m_failed = True
 
                             if m_failed:
                                 mutant_killed = True
@@ -825,6 +1008,7 @@ class CodeVerifier(BaseVerifier):
                 end_time=datetime.now(UTC).isoformat(),
             )
 
+            # A12: Agent-authored test execution output is NEVER independent evidence
             ev = collector.add_evidence(
                 check_id=check.check_id,
                 content=proc_res.stdout + ("\n" + proc_res.stderr if proc_res.stderr else ""),
@@ -832,6 +1016,7 @@ class CodeVerifier(BaseVerifier):
                 claim_id=check.target_claim_id,
                 source="pytest_acceptance",
                 method="targeted_execution",
+                independent=False,
             )
 
             if status != CheckStatus.PASSED and not findings:
@@ -850,6 +1035,174 @@ class CodeVerifier(BaseVerifier):
                 )
 
             return VerifierResult(check_id=check.check_id, execution=execution, evidence=[ev], findings=findings)
+
+    def _verify_constraints(
+        self,
+        project_dir: Path,
+        check: CheckDefinition,
+        collector: EvidenceCollector,
+    ) -> VerifierResult:
+        """Validates task constraints:
+        1. Stdlib-only constraint (scanning against sys.stdlib_module_names and local modules).
+        2. Sensitive data / secret leakage constraint.
+        3. No-network / offline execution constraint.
+        """
+        exec_id = f"exec_{uuid.uuid4().hex[:10]}"
+        constraint_text = check.metadata.get("constraint") or check.description
+        c_lower = constraint_text.lower()
+        findings: list[Finding] = []
+        report_lines: list[str] = [f"Verifying constraint: {constraint_text}"]
+        passed = True
+
+        py_src_files = [
+            p for p in project_dir.rglob("*.py")
+            if not (p.name.startswith("test_") or p.name.endswith("_test.py") or p.name == "conftest.py")
+            and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
+        ]
+
+        # 1. Stdlib-only check
+        if any(term in c_lower for term in ("stdlib", "standard library", "no external dependencies", "standard lib", "only standard library")):
+            stdlib_names: set[str] | frozenset[str] = getattr(sys, "stdlib_module_names", set())
+            unauthorized_imports: list[tuple[str, str]] = []
+            for src_p in py_src_files:
+                try:
+                    tree = ast.parse(src_p.read_text(encoding="utf-8"), filename=str(src_p))
+                    for node in ast.walk(tree):
+                        mod_names: list[str] = []
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                mod_names.append(alias.name.split(".")[0])
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.level == 0 and node.module:
+                                mod_names.append(node.module.split(".")[0])
+
+                        for mod in mod_names:
+                            if mod in stdlib_names:
+                                continue
+                            is_local = (
+                                (project_dir / f"{mod}.py").is_file()
+                                or (project_dir / "src" / f"{mod}.py").is_file()
+                                or (project_dir / mod).is_dir()
+                                or (project_dir / "src" / mod).is_dir()
+                                or (src_p.parent / f"{mod}.py").is_file()
+                            )
+                            if not is_local:
+                                unauthorized_imports.append((src_p.name, mod))
+                except Exception:
+                    pass
+
+            if unauthorized_imports:
+                passed = False
+                details = ", ".join(f"{f} imports '{m}'" for f, m in unauthorized_imports)
+                msg = f"Unauthorized external dependencies detected: {details}. Task requires Python standard library only."
+                report_lines.append(f"FAIL: {msg}")
+                findings.append(
+                    Finding(
+                        finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                        check_id=check.check_id,
+                        claim_id=check.target_claim_id,
+                        title="External Dependency Constraint Violated",
+                        description=msg,
+                        finding_type=FindingType.DEFECT,
+                        severity=FindingSeverity.HIGH,
+                        is_blocking=True,
+                    )
+                )
+            else:
+                report_lines.append(f"PASS: All {len(py_src_files)} source files strictly use standard library modules.")
+
+        # 2. Sensitive data / secrets check
+        if any(term in c_lower for term in ("sensitive", "secret", "password", "token", "credential", "leak", "log")):
+            secret_patterns = [
+                (re.compile(r"(?i)(?:password|passwd|pwd|secret|api[_-]?key|bearer|access[_-]?token)\s*=\s*['\"][A-Za-z0-9_\-+=/]{6,}['\"]"), "hardcoded credential assignment"),
+                (re.compile(r"(?i)postgres(?:ql)?://[A-Za-z0-9_\-]+:[^@\s]+@"), "database connection URI with credentials"),
+                (re.compile(r"sk-[A-Za-z0-9]{20,}"), "OpenAI API key"),
+                (re.compile(r"hf_[A-Za-z0-9]{20,}"), "HuggingFace token"),
+            ]
+            leaks_found: list[str] = []
+            for p in project_dir.rglob("*"):
+                if p.is_file() and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts):
+                    try:
+                        content = p.read_text(encoding="utf-8", errors="ignore")
+                        for pat, pat_desc in secret_patterns:
+                            if pat.search(content):
+                                leaks_found.append(f"{p.name} contains {pat_desc}")
+                    except Exception:
+                        pass
+
+            if leaks_found:
+                passed = False
+                msg = f"Sensitive data exposure detected: {'; '.join(leaks_found[:5])}"
+                report_lines.append(f"FAIL: {msg}")
+                findings.append(
+                    Finding(
+                        finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                        check_id=check.check_id,
+                        claim_id=check.target_claim_id,
+                        title="Sensitive Data Leakage Detected",
+                        description=msg,
+                        finding_type=FindingType.SECURITY_RISK,
+                        severity=FindingSeverity.CRITICAL,
+                        is_blocking=True,
+                    )
+                )
+            else:
+                report_lines.append("PASS: No sensitive credentials, secrets, or passwords found in project files.")
+
+        # 3. Local execution / no network check
+        if any(term in c_lower for term in ("network", "offline", "local")):
+            network_mods = {"requests", "urllib.request", "httpx", "aiohttp", "socket"}
+            for src_p in py_src_files:
+                try:
+                    tree = ast.parse(src_p.read_text(encoding="utf-8"), filename=str(src_p))
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for alias in node.names:
+                                if alias.name in network_mods:
+                                    passed = False
+                                    findings.append(
+                                        Finding(
+                                            finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                                            check_id=check.check_id,
+                                            title="Network Access Constraint Violated",
+                                            description=f"{src_p.name} imports network library '{alias.name}'. Task requires local-only execution.",
+                                            finding_type=FindingType.DEFECT,
+                                            severity=FindingSeverity.HIGH,
+                                            is_blocking=True,
+                                        )
+                                    )
+                except Exception:
+                    pass
+
+        status = CheckStatus.PASSED if passed else CheckStatus.FAILED
+        content = "\n".join(report_lines)
+
+        execution = CheckExecution(
+            execution_id=exec_id,
+            check_id=check.check_id,
+            command=["constraint_inspector", f"[{check.check_id}]"],
+            status=status,
+            stdout=content,
+            exit_code=0 if passed else 1,
+            end_time=datetime.now(UTC).isoformat(),
+        )
+
+        ev = collector.add_evidence(
+            check_id=check.check_id,
+            content=content,
+            evidence_type=EvidenceType.AST_ANALYSIS,
+            claim_id=check.target_claim_id,
+            source="constraint_verifier",
+            method="static_ast_and_content_scan",
+            independent=True,
+        )
+
+        return VerifierResult(
+            check_id=check.check_id,
+            execution=execution,
+            evidence=[ev],
+            findings=findings,
+        )
 
     def _verify_generic_command(
         self,

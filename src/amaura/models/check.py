@@ -26,6 +26,7 @@ class CheckType(str, Enum):
     CITATION_MATCH = "citation_match"
     DOC_CONSTRAINT = "doc_constraint"
     BENCHMARK = "benchmark"
+    CONSTRAINT = "constraint"
 
 
 class CheckDefinition(BaseModel):
