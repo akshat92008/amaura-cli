@@ -27,15 +27,12 @@ def create_directory_manifest(
     root_dir: Path,
     ignore_patterns: set[str] | None = None,
 ) -> dict[str, str]:
-    """Generates an artifact manifest mapping relative paths to their SHA-256 hashes."""
-    ignored = ignore_patterns or {
-        ".git",
-        ".amaura",
-        ".venv",
-        "__pycache__",
-        ".pytest_cache",
-        ".DS_Store",
-    }
+    """Generates an artifact manifest mapping relative paths to their SHA-256 hashes.
+    Directories like .git, .amaura, and .venv are only ignored when root-anchored (B11).
+    """
+    root_anchored_ignored = {".git", ".amaura", ".venv"}
+    anywhere_ignored = ignore_patterns or {"__pycache__", ".pytest_cache", ".DS_Store"}
+
     manifest: dict[str, str] = {}
     resolved_root = root_dir.resolve()
 
@@ -44,13 +41,34 @@ def create_directory_manifest(
 
     for path in sorted(resolved_root.rglob("*")):
         if path.is_file():
-            # Check if any part of the relative path is in ignored
             rel_path = path.relative_to(resolved_root)
-            if any(part in ignored for part in rel_path.parts):
+            # Root-anchor root repository and environment directories
+            if rel_path.parts[0] in root_anchored_ignored:
+                continue
+            # Ignore cache artifacts at any depth
+            if any(part in anywhere_ignored for part in rel_path.parts):
                 continue
             manifest[str(rel_path)] = hash_file(path)
 
     return manifest
+
+
+def compute_artifact_diff(
+    initial_manifest: dict[str, str],
+    final_manifest: dict[str, str],
+) -> dict[str, list[str]]:
+    """Computes added, modified, and deleted artifacts between two directory manifests."""
+    added = sorted([p for p in final_manifest if p not in initial_manifest])
+    deleted = sorted([p for p in initial_manifest if p not in final_manifest])
+    modified = sorted([
+        p for p in final_manifest
+        if p in initial_manifest and final_manifest[p] != initial_manifest[p]
+    ])
+    return {
+        "added": added,
+        "modified": modified,
+        "deleted": deleted,
+    }
 
 
 def verify_manifest_integrity(

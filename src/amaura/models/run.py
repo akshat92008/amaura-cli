@@ -45,3 +45,5 @@ class RunRecord(BaseModel):
     limitations: list[str] = Field(default_factory=list)
     unverified_areas: list[str] = Field(default_factory=list)
     artifacts_manifest: dict[str, str] = Field(default_factory=dict)
+    artifacts_diff: dict[str, list[str]] = Field(default_factory=dict)
+

@@ -96,6 +96,21 @@ def generate_markdown_report(record: RunRecord) -> str:
         md.append("- Real-world runtime concurrency and remote network conditions were not evaluated.")
     md.append("")
 
+    # Artifact Changes section
+    if record.artifacts_diff:
+        added = record.artifacts_diff.get("added", [])
+        modified = record.artifacts_diff.get("modified", [])
+        deleted = record.artifacts_diff.get("deleted", [])
+        if added or modified or deleted:
+            md.append("### Artifact Changes")
+            for a in added:
+                md.append(f"- **Added**: `{a}`")
+            for m in modified:
+                md.append(f"- **Modified**: `{m}`")
+            for d in deleted:
+                md.append(f"- **Deleted**: `{d}`")
+            md.append("")
+
     md.append("---")
     md.append("*Amaura Verify — Never confuse an agent's assertion with evidence that the assertion is true.*")
 

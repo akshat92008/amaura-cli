@@ -29,11 +29,13 @@ def isolated_workspace(source_dir: Path, prefix: str = "amaura_ws_") -> Generato
     """Creates a temporary, isolated copy of the workspace for safe execution and verification."""
     temp_dir = Path(tempfile.mkdtemp(prefix=prefix))
     try:
-        # Copy source contents ignoring .git, .amaura, .venv to keep it clean and fast
+        resolved_source = source_dir.resolve()
+
         def ignore_patterns(dir_path: str, names: list[str]) -> set[str]:
             ignored = set()
+            is_root = Path(dir_path).resolve() == resolved_source
             for name in names:
-                if name in {".git", ".amaura", ".venv", "__pycache__", ".pytest_cache"}:
+                if is_root and name in {".git", ".amaura", ".venv"} or name in {"__pycache__", ".pytest_cache"}:
                     ignored.add(name)
             return ignored
 

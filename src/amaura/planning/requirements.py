@@ -4,7 +4,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-import yaml
+import yaml  # type: ignore[import-untyped]
 
 from amaura.errors import TaskSpecificationError
 from amaura.models.task import Requirement, RiskLevel, TaskSpec
@@ -124,16 +124,29 @@ def load_task_file(task_path: Path, expected_hash: Optional[str] = None) -> Task
         data = yaml.safe_load(content)
         if not isinstance(data, dict):
             raise TaskSpecificationError("YAML task specification must be a dictionary")
+        if "task_hash" in data and not isinstance(data["task_hash"], str):
+            data["task_hash"] = str(data["task_hash"])
         task = TaskSpec.model_validate(data)
         if not task.requirements:
             raise TaskSpecificationError("Task specification must contain at least one requirement.")
-        if not task.frozen:
-            task.freeze()
+        canonical_hash = task.compute_hash()
+        # Prevent task hash forgery via YAML frozen and task_hash fields (B6)
+        if task.task_hash and task.task_hash != canonical_hash:
+            raise TaskSpecificationError(
+                f"Task specification tampering detected: Provided task_hash '{task.task_hash}' "
+                f"does not match canonical specification hash '{canonical_hash}'."
+            )
+        task.task_hash = canonical_hash
+        task.frozen = True
     else:
         task = parse_markdown_task(content, filename=task_path.name)
 
+    # Mandatory: verify hash integrity against canonical computation (B6)
+    if not task.verify_hash():
+        raise TaskSpecificationError("Task specification hash verification failed: task is corrupted or modified.")
+
     # Enforce hash verification if expected_hash provided
-    if expected_hash and task.task_hash != expected_hash:
+    if expected_hash and not task.verify_hash(expected_hash):
         raise TaskSpecificationError(
             f"Task integrity violation: Task specification hash mismatch! "
             f"Expected: {expected_hash}, Computed: {task.task_hash}. The task was modified after freezing."

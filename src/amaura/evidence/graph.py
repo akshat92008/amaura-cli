@@ -91,3 +91,29 @@ class EvidenceGraph:
             if not chain.check_ids or claim.status.value != "supported":
                 unverified.append(claim)
         return unverified
+
+    def to_dict(self) -> dict:
+        """Serializes the complete evidence graph into a dictionary for persistence."""
+        return {
+            "claims": {k: v.model_dump(mode="json") for k, v in self.claims.items()},
+            "checks": {k: v.model_dump(mode="json") for k, v in self.checks.items()},
+            "executions": {k: v.model_dump(mode="json") for k, v in self.executions.items()},
+            "evidence": {k: v.model_dump(mode="json") for k, v in self.evidence.items()},
+            "findings": {k: v.model_dump(mode="json") for k, v in self.findings.items()},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EvidenceGraph":
+        """Reconstructs an EvidenceGraph from a serialized dictionary."""
+        graph = cls()
+        for c in data.get("claims", {}).values():
+            graph.add_claim(Claim.model_validate(c))
+        for chk in data.get("checks", {}).values():
+            graph.add_check(CheckDefinition.model_validate(chk))
+        for ex in data.get("executions", {}).values():
+            graph.add_execution(CheckExecution.model_validate(ex))
+        for ev in data.get("evidence", {}).values():
+            graph.add_evidence(EvidenceItem.model_validate(ev))
+        for f in data.get("findings", {}).values():
+            graph.add_finding(Finding.model_validate(f))
+        return graph

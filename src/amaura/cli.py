@@ -351,6 +351,42 @@ def policy(
     console.print(table)
 
 
+@app.command(name="runs")
+def list_runs_cmd():
+    """List historical verification runs sorted chronologically."""
+    cfg = AmauraConfig.load()
+    ledger = EvidenceLedger(Path(cfg.runs_dir))
+    run_ids = ledger.list_runs()
+    if not run_ids:
+        console.print(f"[yellow]No verification runs found in {ledger.runs_dir}[/yellow]")
+        return
+
+    table = Table(title="Amaura Historical Verification Runs", show_header=True)
+    table.add_column("Run ID", style="cyan")
+    table.add_column("Timestamp", style="dim")
+    table.add_column("Verdict", style="bold")
+    table.add_column("Policy")
+    table.add_column("Task ID", style="dim")
+
+    for rid in run_ids:
+        try:
+            rec = ledger.load_run(rid, verify_integrity=False)
+            if rec:
+                table.add_row(
+                    rec.run_id,
+                    rec.timestamp,
+                    rec.overall_verdict.value.upper(),
+                    rec.policy_applied,
+                    rec.task.task_id,
+                )
+            else:
+                table.add_row(rid, "-", "-", "-", "-")
+        except Exception:
+            table.add_row(rid, "[red]CORRUPT[/red]", "-", "-", "-")
+
+    console.print(table)
+
+
 @app.command()
 def benchmark(
     suite: str = typer.Option("all", "--suite", "-s", help="Benchmark suite to execute"),

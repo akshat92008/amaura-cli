@@ -635,3 +635,239 @@ def test_probe_unseeded_randomness_detected(tmp_path: Path):
     assert res.execution.status == CheckStatus.FAILED
     assert any("Unseeded Random Operations" in f.title for f in res.findings)
 
+
+def test_probe_b1_deleted_ledger_chain_detected(tmp_path: Path):
+    """Deleting ledger_chain.jsonl must trigger a TAMPER DETECTED discrepancy (B1)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+    # Verification succeeds initially
+    loaded = ledger.load_run(record.run_id)
+    assert loaded.run_id == record.run_id
+
+    # Adversary deletes master ledger chain
+    ledger.chain_file.unlink()
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.load_run(record.run_id)
+    assert "Master ledger chain file 'ledger_chain.jsonl' is missing" in str(exc_info.value)
+
+
+def test_probe_b2_run_absent_from_chain_and_tail_truncation_detected(tmp_path: Path):
+    """A run absent from the chain or chain tail truncation must be detected as tampering (B2)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record1 = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+    record2 = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+
+    # 1. Chain tail truncation: remove the last block
+    lines = ledger.chain_file.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    ledger.chain_file.write_text(lines[0] + "\n", encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.load_run(record2.run_id)
+    assert any(m in str(exc_info.value).lower() for m in ["truncation detected", "not present in the immutable ledger chain"])
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info2:
+        ledger.load_run(record1.run_id)
+    assert "truncation detected" in str(exc_info2.value).lower()
+
+
+def test_probe_b3_immutability_prevents_double_save(tmp_path: Path):
+    """Attempting to save an already persisted run must fail with EvidenceIntegrityError (B3)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.save_run(record)
+    assert "already been persisted and is immutable" in str(exc_info.value)
+
+
+def test_probe_b4_anchor_signature_protects_against_recomputation(tmp_path: Path):
+    """Recomputing the chain with forged blocks fails because HMAC anchor signature does not match (B4)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+
+    # Adversary modifies ledger anchor file
+    anchor_data = json.loads(ledger.anchor_file.read_text(encoding="utf-8"))
+    anchor_data["signature"] = "deadbeef" * 8
+    ledger.anchor_file.write_text(json.dumps(anchor_data), encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.load_run(record.run_id)
+    assert "Invalid HMAC signature on ledger anchor" in str(exc_info.value)
+
+
+def test_probe_b5_corrupt_block_does_not_reset_prev_hash(tmp_path: Path):
+    """A corrupted last block must raise EvidenceIntegrityError, not silently reset prev_hash (B5)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    # Write corrupt block into chain
+    ledger.chain_file.write_text("CORRUPTED_NON_JSON_DATA\n", encoding="utf-8")
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger._append_to_chain("run_test_new", "some_hash")
+    assert "last block is corrupted" in str(exc_info.value)
+
+
+def test_probe_b6_task_hash_forgery_via_yaml_blocked(tmp_path: Path):
+    """YAML task specifying a forged task_hash must be rejected with TaskSpecificationError (B6)."""
+    task_file = tmp_path / "task.yaml"
+    task_file.write_text(
+        "task_id: test_task\n"
+        "instruction: Do something safe\n"
+        "risk_level: low\n"
+        "frozen: true\n"
+        'task_hash: "0000000000000000000000000000000000000000000000000000000000000000"\n'
+        "requirements:\n"
+        "  - id: REQ-001\n"
+        "    description: First requirement\n"
+        "    mandatory: true\n"
+    )
+
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        load_task_file(task_file)
+    assert "tampering detected" in str(exc_info.value).lower() or "mismatch" in str(exc_info.value).lower()
+
+
+def test_probe_b7_evidence_graph_and_ledger_persisted_and_checked(tmp_path: Path):
+    """Evidence graph is persisted and tampering with evidence_ledger.jsonl is detected (B7)."""
+    runs_dir = tmp_path / "runs"
+    ledger = EvidenceLedger(runs_dir)
+
+    record = verify_project(
+        project_dir=Path("examples/csv-import/version_a_correct"),
+        task_file=Path("examples/csv-import/task.md"),
+        config=AmauraConfig(runs_dir=str(runs_dir)),
+    )
+
+    run_dir = runs_dir / record.run_id
+    assert (run_dir / "evidence_graph.json").is_file()
+    assert (run_dir / "evidence_ledger.jsonl").is_file()
+    assert (run_dir / "evidence_ledger.sha256").is_file()
+
+    # Tamper with evidence_ledger.jsonl
+    with open(run_dir / "evidence_ledger.jsonl", "a", encoding="utf-8") as f:
+        f.write("MALFORMED JSON LINE\n")
+
+    with pytest.raises(EvidenceIntegrityError) as exc_info:
+        ledger.load_run(record.run_id)
+    assert "evidence_ledger.jsonl" in str(exc_info.value)
+
+
+def test_probe_b8_universal_redaction_in_collector():
+    """EvidenceCollector automatically sanitizes secret patterns (B8)."""
+    from amaura.evidence.collector import EvidenceCollector
+    collector = EvidenceCollector("run_test_redact")
+    stripe_key = "sk_" + "live_1234567890abcdef12345678"
+    google_key = "AIza" + "SyDa-1234567890abcdef1234567890abc"
+    ev1 = collector.add_evidence("chk_1", f"Secret stripe key: {stripe_key}")
+    ev2 = collector.add_evidence("chk_2", f"Secret google key: {google_key}")
+    ev3 = collector.add_evidence("chk_3", "pwd = 'pass'")
+
+    assert "sk_live_" not in ev1.content
+    assert "[REDACTED_STRIPE_KEY]" in ev1.content
+    assert "AIza" not in ev2.content
+    assert "[REDACTED_GOOGLE_API_KEY]" in ev2.content
+    assert "'pass'" not in ev3.content
+
+
+def test_probe_b9_chronological_run_ids(tmp_path: Path):
+    """Run IDs are generated chronologically and list_runs returns them in order (B9)."""
+    from amaura.orchestration.state import ExecutionContext
+    ctx1 = ExecutionContext(tmp_path)
+    import time
+    time.sleep(0.01)
+    ctx2 = ExecutionContext(tmp_path)
+
+    assert ctx1.run_id.startswith("run_")
+    assert ctx2.run_id.startswith("run_")
+    assert ctx1.run_id <= ctx2.run_id
+
+
+def test_probe_b10_require_clean_git_enforced(tmp_path: Path):
+    """Policy requiring clean git fails closed when target has uncommitted changes (B10)."""
+    import subprocess
+    # Init a git repo in tmp_path
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Amaura Tester"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@amaura.dev"], cwd=tmp_path, check=True, capture_output=True)
+
+    dummy = tmp_path / "calc.py"
+    dummy.write_text("def add(a, b): return a + b\n")
+    test_f = tmp_path / "test_calc.py"
+    test_f.write_text("from calc import add\ndef test_add(): assert add(1, 2) == 3\n")
+    task_f = tmp_path / "task.md"
+    task_f.write_text("# Task\n## Requirements\n- REQ-001: Addition works\n")
+
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=tmp_path, check=True, capture_output=True)
+
+    # Now make it dirty by modifying calc.py
+    dummy.write_text("def add(a, b): return a + b # dirty\n")
+
+    cfg = AmauraConfig()
+    cfg.policy.require_clean_git = True
+    cfg.runs_dir = str(tmp_path / "runs")
+
+    rec = verify_project(project_dir=tmp_path, task_file=task_f, config=cfg)
+    assert rec.overall_verdict == OverallVerdict.FAILED
+    assert any("Git Repository Not Clean" in f.title for f in rec.findings)
+    assert rec.git_clean is False
+    assert rec.git_commit is not None
+
+
+def test_probe_b11_root_anchored_ignores_and_artifact_diff(tmp_path: Path):
+    """Nested directories named .venv or .amaura are preserved in manifest and diff is computed (B11)."""
+    from amaura.evidence.hashing import compute_artifact_diff, create_directory_manifest
+    # Root level .venv should be ignored
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "pip.txt").write_text("ignore me")
+
+    # Subdirectory .venv should NOT be ignored
+    (tmp_path / "subpkg" / ".venv").mkdir(parents=True)
+    (tmp_path / "subpkg" / ".venv" / "keep.py").write_text("def kept(): pass")
+
+    manifest1 = create_directory_manifest(tmp_path)
+    assert "pip.txt" not in str(manifest1)
+    assert str(Path("subpkg/.venv/keep.py")) in manifest1
+
+    # Modify and add files
+    (tmp_path / "new_file.txt").write_text("new content")
+    (tmp_path / "subpkg" / ".venv" / "keep.py").write_text("def modified(): pass")
+
+    manifest2 = create_directory_manifest(tmp_path)
+    diff = compute_artifact_diff(manifest1, manifest2)
+
+    assert "new_file.txt" in diff["added"]
+    assert str(Path("subpkg/.venv/keep.py")) in diff["modified"]
+    assert len(diff["deleted"]) == 0
+

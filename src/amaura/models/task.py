@@ -35,18 +35,29 @@ class TaskSpec(BaseModel):
     frozen: bool = False
 
     def compute_hash(self) -> str:
-        """Computes deterministic SHA-256 hash of the complete task specification."""
-        content = f"{self.task_id}:{self.instruction}:{self.risk_level.value}:{len(self.requirements)}"
-        for req in sorted(self.requirements, key=lambda r: r.id):
-            crit_str = ",".join(sorted(req.acceptance_criteria))
-            content += f":{req.id}:{req.description}:{req.mandatory}:{req.risk_level.value}:{req.domain}:{crit_str}"
-        for c in sorted(self.constraints):
-            content += f":constraint:{c}"
-        for a in sorted(self.assumptions):
-            content += f":assumption:{a}"
-        for ac in sorted(self.acceptance_criteria):
-            content += f":acceptance:{ac}"
-        return hashlib.sha256(content.encode("utf-8")).hexdigest()
+        """Computes deterministic, canonical SHA-256 hash of the complete task specification."""
+        import json
+        payload = {
+            "task_id": self.task_id,
+            "instruction": self.instruction,
+            "risk_level": self.risk_level.value,
+            "requirements": [
+                {
+                    "id": req.id,
+                    "description": req.description,
+                    "mandatory": req.mandatory,
+                    "risk_level": req.risk_level.value,
+                    "domain": req.domain,
+                    "acceptance_criteria": sorted(req.acceptance_criteria),
+                }
+                for req in sorted(self.requirements, key=lambda r: r.id)
+            ],
+            "constraints": sorted(self.constraints),
+            "assumptions": sorted(self.assumptions),
+            "acceptance_criteria": sorted(self.acceptance_criteria),
+        }
+        canonical_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
     def freeze(self) -> "TaskSpec":
         """Freezes the task specification to prevent silent redefinition of requirements."""

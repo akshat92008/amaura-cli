@@ -52,6 +52,7 @@ def verify_project(
         return pipeline.run(
             project_dir=ws,
             task=task,
+            source_dir=project_dir,
             mode=RunMode.VERIFY,
             policy_override=policy_profile,
         )
@@ -82,6 +83,7 @@ def audit_project(
         record = pipeline.run(
             project_dir=ws,
             task=task,
+            source_dir=project_dir,
             mode=RunMode.AUDIT,
         )
 
@@ -113,6 +115,7 @@ def check_claims(
             project_dir=ws,
             task=task,
             claims=claims,
+            source_dir=target_dir,
             mode=RunMode.CLAIM_CHECK,
         )
 
@@ -145,12 +148,10 @@ def run_and_verify(
         record = pipeline.run(
             project_dir=ws,
             task=task,
+            source_dir=base_dir,
             mode=RunMode.RUN,
             policy_override=policy_profile,
+            extra_limitations=[f"Agent '{agent_name}' result: success={agent_res.success}"],
         )
-
-        # Record agent execution metadata into record and re-persist to disk
-        record.limitations.append(f"Agent '{agent_name}' result: success={agent_res.success}")
-        pipeline.ledger.save_run(record)
 
     return record

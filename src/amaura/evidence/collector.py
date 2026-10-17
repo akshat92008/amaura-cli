@@ -5,6 +5,7 @@ import uuid
 from amaura.evidence.hashing import hash_string
 from amaura.evidence.provenance import build_provenance
 from amaura.models.evidence import EvidenceItem, EvidenceType
+from amaura.security.redaction import redact_secrets
 
 
 class EvidenceCollector:
@@ -26,17 +27,18 @@ class EvidenceCollector:
         independent: bool = False,
         limitations: list[str] | None = None,
     ) -> EvidenceItem:
-        """Creates and indexes a new EvidenceItem."""
+        """Creates and indexes a new EvidenceItem with automated secret scrubbing."""
         evidence_id = f"ev_{uuid.uuid4().hex[:10]}"
         provenance = build_provenance(source=source, method=method, independent=independent)
 
+        sanitized_content = redact_secrets(content)
         item = EvidenceItem(
             evidence_id=evidence_id,
             check_id=check_id,
             claim_id=claim_id,
             evidence_type=evidence_type,
-            content=content,
-            content_hash=hash_string(content),
+            content=sanitized_content,
+            content_hash=hash_string(sanitized_content),
             provenance=provenance,
             limitations=limitations or [],
         )

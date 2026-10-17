@@ -6,6 +6,9 @@ from re import Pattern
 # Comprehensive secret patterns matching credentials, tokens, DB connection strings, and keys
 SECRET_PATTERNS: list[tuple[str, Pattern]] = [
     ("OPENAI_KEY", re.compile(r"sk-[a-zA-Z0-9_-]{20,}")),
+    ("STRIPE_KEY", re.compile(r"sk_(?:live|test)_[0-9a-zA-Z]{24,}")),
+    ("GOOGLE_API_KEY", re.compile(r"AIza[0-9A-Za-z\-_]{30,45}")),
+    ("JWT_TOKEN", re.compile(r"eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,}")),
     ("GITHUB_TOKEN", re.compile(r"gh[pousr][_-][a-zA-Z0-9]{20,}")),
     ("HUGGINGFACE_TOKEN", re.compile(r"hf_[a-zA-Z0-9]{30,}")),
     ("SUPABASE_KEY", re.compile(r"sbp_[a-zA-Z0-9]{20,}")),
@@ -25,7 +28,7 @@ SECRET_PATTERNS: list[tuple[str, Pattern]] = [
         "GENERIC_API_KEY",
         re.compile(
             r"(?i)(?:api[_-]?key|secret[_-]?key)"
-            r"\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{12,})['\"]?"
+            r"\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{6,})['\"]?"
         ),
     ),
     (
@@ -36,7 +39,7 @@ SECRET_PATTERNS: list[tuple[str, Pattern]] = [
         "GENERIC_CREDENTIAL",
         re.compile(
             r"(?i)(?:access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|pwd)"
-            r"\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{12,})['\"]?"
+            r"\s*[:=]\s*['\"]?([a-zA-Z0-9_\-\.]{4,})['\"]?"
         ),
     ),
 ]
