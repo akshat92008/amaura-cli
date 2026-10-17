@@ -52,3 +52,34 @@ def test_cli_benchmark():
     assert result.exit_code == 0
     assert "100.0%" in result.output
     assert "PASSED" in result.output
+
+
+def test_cli_review():
+    base_dir = Path(__file__).resolve().parents[2]
+    proj = str(base_dir / "examples" / "csv-import" / "version_a_correct")
+    task = str(base_dir / "examples" / "csv-import" / "task.md")
+    result = runner.invoke(app, ["review", proj, "--task", task])
+    assert result.exit_code == 0
+    assert "Task Requirements" in result.output
+    assert "REQ-001" in result.output
+
+
+def test_cli_format_json():
+    import json
+    base_dir = Path(__file__).resolve().parents[2]
+    proj = str(base_dir / "examples" / "csv-import" / "version_a_correct")
+    task = str(base_dir / "examples" / "csv-import" / "task.md")
+    result = runner.invoke(app, ["audit", proj, "--task", task, "--format", "json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["overall_verdict"] == "passed"
+    assert "run_id" in data
+
+
+def test_cli_benchmark_suite():
+    result = runner.invoke(app, ["benchmark", "--suite", "csv"])
+    assert result.exit_code == 0
+    assert "100.0%" in result.output
+
+    result_bad = runner.invoke(app, ["benchmark", "--suite", "nonexistent"])
+    assert result_bad.exit_code == 1

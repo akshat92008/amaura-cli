@@ -132,16 +132,9 @@ def run_safe_process(
             except Exception:
                 pass
 
-    # Write sitecustomize.py for network lockdown (C1) and filesystem isolation (C2)
-    guard_file = sandbox_home / "sitecustomize.py"
-    guard_code = f"""# Amaura Security Sandbox (sitecustomize.py)
-import builtins
-import io
-import os
-import socket
-import sys
-from pathlib import Path
-
+    network_guard_snippet = ""
+    if sec.privacy_mode.value == "local_only" or not sec.allow_network:
+        network_guard_snippet = """
 # --- C1: Network Lockdown (Rule 9) ---
 def _blocked_network(*args, **kwargs):
     raise PermissionError("Amaura Security Policy: Network operations are strictly prohibited in local_only mode (Rule 9).")
@@ -156,7 +149,18 @@ socket.create_connection = _blocked_network
 socket.getaddrinfo = _blocked_network
 socket.gethostbyname = _blocked_network
 socket.gethostbyname_ex = _blocked_network
+"""
 
+    # Write sitecustomize.py for network lockdown (C1) and filesystem isolation (C2)
+    guard_file = sandbox_home / "sitecustomize.py"
+    guard_code = f"""# Amaura Security Sandbox (sitecustomize.py)
+import builtins
+import io
+import os
+import socket
+import sys
+from pathlib import Path
+{network_guard_snippet}
 # --- C2: Filesystem Isolation ---
 _ALLOWED_WRITE_ROOTS = [{", ".join(repr(r) for r in allowed_roots)}]
 _SENSITIVE_HOST_READ_PATHS = [{", ".join(repr(p) for p in sensitive_host_paths)}]

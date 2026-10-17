@@ -166,9 +166,13 @@ class VerdictEvaluator:
                 claim_copy.status = ClaimStatus.CONTRADICTED
                 claim_copy.limitations.append("Contradicted by observed test failure or defect.")
             elif claim_gaps or not acceptance_checks or not has_passed_acceptance:
-                claim_copy.status = ClaimStatus.INCONCLUSIVE
-                claim_copy.limitations.append("Insufficient evidence: missing or unexecuted dedicated acceptance test.")
-                unverified.append(claim.text)
+                if not getattr(self.policy.config, "require_all_mandatory_acceptance_tests", True):
+                    claim_copy.status = ClaimStatus.SUPPORTED
+                    claim_copy.limitations.append("Acceptance tests were not strictly required by policy configuration.")
+                else:
+                    claim_copy.status = ClaimStatus.INCONCLUSIVE
+                    claim_copy.limitations.append("Insufficient evidence: missing or unexecuted dedicated acceptance test.")
+                    unverified.append(claim.text)
             else:
                 claim_copy.status = ClaimStatus.SUPPORTED
 
@@ -193,9 +197,14 @@ class VerdictEvaluator:
 
         # Case B: Timed out mandatory checks (fail-closed)
         elif timed_out_mandatory_checks:
-            overall = OverallVerdict.FAILED
-            for chk_name in timed_out_mandatory_checks:
-                reasons.append(f"Mandatory check exceeded budget and timed out: '{chk_name}'")
+            if getattr(self.policy.config, "fail_closed_on_timeout", True):
+                overall = OverallVerdict.FAILED
+                for chk_name in timed_out_mandatory_checks:
+                    reasons.append(f"Mandatory check exceeded budget and timed out: '{chk_name}'")
+            else:
+                overall = OverallVerdict.INCONCLUSIVE
+                for chk_name in timed_out_mandatory_checks:
+                    reasons.append(f"Mandatory check timed out (fail-closed disabled): '{chk_name}'")
 
         # Case C: Strict policy failure for gaps or non-mandatory issues
         elif self.policy.profile == PolicyProfile.STRICT and (
@@ -215,9 +224,13 @@ class VerdictEvaluator:
 
         # Case D: Missing mandatory checks or untested requirement gaps (Default/Permissive -> INCONCLUSIVE)
         elif missing_mandatory_checks or gap_findings:
-            overall = OverallVerdict.INCONCLUSIVE
-            if missing_mandatory_checks:
-                reasons.append(f"Mandatory checks were not executed: {', '.join(missing_mandatory_checks)}")
+            if missing_mandatory_checks and getattr(self.policy.config, "fail_closed_on_missing_check", True) and self.policy.profile == PolicyProfile.STRICT:
+                overall = OverallVerdict.FAILED
+                reasons.append(f"Strict policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
+            else:
+                overall = OverallVerdict.INCONCLUSIVE
+                if missing_mandatory_checks:
+                    reasons.append(f"Mandatory checks were not executed: {', '.join(missing_mandatory_checks)}")
             for g in gap_findings:
                 reasons.append(f"Verification gap: {g.title} - {g.description[:120]}")
 

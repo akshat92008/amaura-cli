@@ -666,6 +666,7 @@ class CodeVerifier(BaseVerifier):
             f"Skipped tests: {len(skipped_tests)}",
         ]
 
+        allow_vacuous = getattr(getattr(self.config, "policy", None), "allow_vacuous_tests", False)
         if vacuous_tests:
             report_lines.extend(["Vacuous test instances:"] + [f" - {vt}" for vt in vacuous_tests])
             findings.append(
@@ -675,8 +676,8 @@ class CodeVerifier(BaseVerifier):
                     title="Vacuous Test Assertions Detected",
                     description=f"Tests found with zero valid assertions or trivial asserts (e.g. assert True, 1==1): {', '.join(vacuous_tests)}",
                     finding_type=FindingType.TEST_GAP,
-                    severity=FindingSeverity.HIGH,
-                    is_blocking=True,
+                    severity=FindingSeverity.LOW if allow_vacuous else FindingSeverity.HIGH,
+                    is_blocking=not allow_vacuous,
                 )
             )
 
@@ -694,7 +695,7 @@ class CodeVerifier(BaseVerifier):
                 )
             )
 
-        status = CheckStatus.PASSED if not vacuous_tests else CheckStatus.FAILED
+        status = CheckStatus.PASSED if (not vacuous_tests or allow_vacuous) else CheckStatus.FAILED
         content = "\n".join(report_lines)
 
         execution = CheckExecution(

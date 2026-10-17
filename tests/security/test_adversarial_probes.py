@@ -1283,4 +1283,206 @@ def test_probe_d7_clean_claim_text_and_no_arbitrary_bullets(tmp_path: Path):
     assert "must contain an explicit '## Requirements' section" in str(exc_info.value)
 
 
+def test_probe_e1_format_json_no_line_wrapping_json_load(tmp_path: Path):
+    """--format json outputs raw valid JSON without terminal width wrapping, parsing cleanly in json.loads (E1)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+
+    runner = CliRunner()
+    task_file = tmp_path / "task.md"
+    long_instruction = "A" * 300  # Longer than 80 columns
+    task_file.write_text(f"# Task\n{long_instruction}\n\n## Requirements\n- REQ-001: Correctness\n")
+    
+    src_dir = tmp_path / "src_e1"
+    src_dir.mkdir()
+    (src_dir / "mod.py").write_text("x = 1\n")
+
+    result = runner.invoke(app, ["audit", str(src_dir), "--task", str(task_file), "--format", "json"])
+    assert result.exit_code in (0, 1, 2)
+    
+    # Must parse cleanly with json.loads
+    parsed = json.loads(result.output)
+    assert "run_id" in parsed
+    assert "overall_verdict" in parsed
+    assert parsed["task"]["instruction"] == long_instruction
+
+
+def test_probe_e2_report_show_evidence_no_markup_error_on_path_brackets(tmp_path: Path, monkeypatch):
+    """report --show-evidence does not crash with MarkupError when evidence contains [/usr/lib] (E2)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import _print_run_summary, app
+    from amaura.evidence.ledger import EvidenceLedger
+    from amaura.models.evidence import EvidenceItem, Provenance
+    from amaura.models.run import OverallVerdict, RunMode, RunRecord
+
+    cfg = AmauraConfig()
+    cfg.runs_dir = str(tmp_path / "runs_e2")
+    ledger = EvidenceLedger(Path(cfg.runs_dir))
+
+    task = TaskSpec(task_id="task_e2", instruction="Test task [/usr/lib] markup safe", requirements=[])
+    content_str = "Log traces: [/usr/lib/libSystem.B.dylib] and [unclosed bracket"
+    record = RunRecord(
+        run_id="run_e2_test",
+        mode=RunMode.VERIFY,
+        task=task,
+        working_dir=str(tmp_path),
+        overall_verdict=OverallVerdict.PASSED,
+        verdict_reasons=["Looked in directory [/usr/lib] safely"],
+        findings=[
+            Finding(
+                finding_id="find_e2",
+                check_id="chk_e2",
+                title="Tested Path [/usr/lib/libc.so]",
+                description="Verified containment on [/usr/lib/security] bracket tags",
+                finding_type=FindingType.DEFECT,
+                severity=FindingSeverity.LOW,
+            )
+        ],
+        evidence=[
+            EvidenceItem(
+                evidence_id="ev_e2_001",
+                check_id="chk_e2",
+                content=content_str,
+                content_hash=hashlib.sha256(content_str.encode("utf-8")).hexdigest(),
+                provenance=Provenance(source="test", method="execution"),
+            )
+        ],
+    )
+    ledger.save_run(record)
+
+    # 1. Direct function call test
+    _print_run_summary(record, show_evidence=True)
+
+    # 2. CLI report command test
+    monkeypatch.setattr("amaura.cli.AmauraConfig.load", lambda *args, **kwargs: cfg)
+    runner = CliRunner()
+    res = runner.invoke(app, ["report", "run_e2_test", "--show-evidence"])
+    assert res.exit_code == 0
+    assert "[/usr/lib" in res.output
+
+
+def test_probe_e3_allow_network_and_benchmark_suite_filter_and_config(tmp_path: Path):
+    """--allow-network permits network in sandbox, benchmark --suite filters, and config is passed (E3)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+    from amaura.config import SecurityConfig
+    from amaura.security.process import run_safe_process
+
+    # 1. When allow_network=True and privacy_mode != local_only, socket is not blocked
+    sec_allowed = SecurityConfig(allow_network=True, privacy_mode=PrivacyMode.HYBRID)
+    # Testing that sitecustomize does not crash with PermissionError when socket is loaded
+    code = "import socket; s = socket.socket(); print('socket_init_ok')"
+    res = run_safe_process([sys.executable, "-c", code], cwd=tmp_path, security_config=sec_allowed)
+    assert "socket_init_ok" in res.stdout
+
+    # 2. Benchmark suite filtering
+    runner = CliRunner()
+    res_bad_suite = runner.invoke(app, ["benchmark", "--suite", "nonexistent_suite_xyz"])
+    assert res_bad_suite.exit_code == 1
+    assert "Unknown benchmark suite" in res_bad_suite.output
+
+    res_good_suite = runner.invoke(app, ["benchmark", "--suite", "csv"])
+    assert res_good_suite.exit_code == 0
+    assert "100.0%" in res_good_suite.output
+
+
+def test_probe_e4_doctor_pytest_and_real_security_probes():
+    """doctor checks pytest in active environment and performs real runtime security probes (E4)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+
+    runner = CliRunner()
+    res = runner.invoke(app, ["doctor", "--check-security"])
+    assert res.exit_code == 0
+    assert "Test Runner (pytest)" in res.output
+    assert "PASS" in res.output
+    assert "Network Sandbox Probe" in res.output
+    assert "Filesystem Isolation" in res.output
+    assert "Redactor Probe" in res.output
+
+
+def test_probe_e5_evidence_exits_nonzero_when_no_match(tmp_path: Path):
+    """evidence command exits with code 1 when no evidence item matches (E5)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+
+    runner = CliRunner()
+    res = runner.invoke(app, ["evidence", "nonexistent_evidence_target_id_9999"])
+    assert res.exit_code != 0
+    assert "No evidence item matched" in res.output or "not found" in res.output.lower()
+
+
+def test_probe_e6_review_and_replay_commands(tmp_path: Path, monkeypatch):
+    """review and replay CLI commands execute and verify artifacts, requirements, and determinism (E6)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+    from amaura.orchestration.runner import verify_project
+
+    runner = CliRunner()
+
+    # 1. Review command on local directory
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# Task\n## Requirements\n- REQ-001: Review requirement\n")
+    src_dir = tmp_path / "src_e6"
+    src_dir.mkdir()
+    (src_dir / "app.py").write_text("print('hello')\n")
+
+    res_review = runner.invoke(app, ["review", str(src_dir), "--task", str(task_file)])
+    assert res_review.exit_code == 0
+    assert "REQ-001" in res_review.output
+    assert "app.py" in res_review.output
+
+    # 2. Replay command on an authentic recorded run
+    cfg = AmauraConfig()
+    cfg.runs_dir = str(tmp_path / "runs_e6")
+    record = verify_project(project_dir=src_dir, task_file=task_file, config=cfg)
+
+    # Replay against src_dir
+    monkeypatch.setattr("amaura.cli.AmauraConfig.load", lambda *args, **kwargs: cfg)
+    res_replay = runner.invoke(app, ["replay", record.run_id, "--project", str(src_dir)])
+    assert res_replay.exit_code == 0
+    assert "REPRODUCED" in res_replay.output
+    assert "Replay successful" in res_replay.output
+
+
+def test_probe_e7_policy_knobs_effective(tmp_path: Path):
+    """policy command respects profile option and policy knobs govern evaluator and verifier (E7)."""
+    from typer.testing import CliRunner
+
+    from amaura.cli import app
+    from amaura.config import VerificationPolicyConfig
+    from amaura.verdicts.evaluator import VerdictEvaluator
+    from amaura.verdicts.policy import VerdictPolicy
+
+    # 1. CLI policy displays profile
+    runner = CliRunner()
+    res_policy = runner.invoke(app, ["policy", "--profile", "strict"])
+    assert res_policy.exit_code == 0
+    assert "Profile: STRICT" in res_policy.output
+
+    # 2. fail_closed_on_timeout knob has real effect in VerdictEvaluator
+    task = TaskSpec(task_id="t_e7", instruction="Policy task", requirements=[])
+    chk = CheckDefinition(check_id="chk_mandatory_timeout", name="Mandatory Timeout Check", mandatory=True)
+    exec_timeout = CheckExecution(execution_id="ex_to", check_id="chk_mandatory_timeout", status=CheckStatus.TIMED_OUT)
+
+    # When fail_closed_on_timeout=True -> FAILED
+    pol_cfg_fail_closed = VerificationPolicyConfig(fail_closed_on_timeout=True)
+    evaluator_fc = VerdictEvaluator(VerdictPolicy(pol_cfg_fail_closed))
+    res_fc = evaluator_fc.evaluate(task, [], [chk], [exec_timeout], [])
+    assert res_fc.overall_verdict == OverallVerdict.FAILED
+
+    # When fail_closed_on_timeout=False -> INCONCLUSIVE
+    pol_cfg_open = VerificationPolicyConfig(fail_closed_on_timeout=False)
+    evaluator_open = VerdictEvaluator(VerdictPolicy(pol_cfg_open))
+    res_open = evaluator_open.evaluate(task, [], [chk], [exec_timeout], [])
+    assert res_open.overall_verdict == OverallVerdict.INCONCLUSIVE
+
+
+
 
