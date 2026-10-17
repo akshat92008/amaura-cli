@@ -799,7 +799,8 @@ def benchmark(
         raise typer.Exit(code=1)
 
     runner = BenchmarkRunner(config=cfg)
-    metrics = runner.run_suite(filtered_cases)
+    min_req_cases = 5 if suite_clean in ("all", "full") else 1
+    metrics = runner.run_suite(filtered_cases, min_cases=min_req_cases)
 
     table = Table(title=f"Amaura Reliability Benchmark & Release Gate Evaluation (Suite: {suite})", show_header=True)
     table.add_column("Evaluation Metric", style="cyan")

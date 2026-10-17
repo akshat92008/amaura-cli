@@ -34,7 +34,7 @@ class BenchmarkMetrics(BaseModel):
 
     passed_release_gate: bool = False
 
-    def compute(self) -> "BenchmarkMetrics":
+    def compute(self, min_cases: int = 1) -> "BenchmarkMetrics":
         if self.known_bad_cases > 0:
             self.defect_recall = self.true_positives / self.known_bad_cases
         if self.critical_defects_total > 0:
@@ -44,11 +44,16 @@ class BenchmarkMetrics(BaseModel):
         if self.adversarial_cases > 0:
             self.adversarial_detection_rate = self.adversarial_detected / self.adversarial_cases
 
-        # G1 Release gate criteria: 100% defect recall, 100% critical defect recall, and 0% false positive rate
+        # Release gate criteria: must have cases, 100% defect recall, 100% critical defect recall, 0% false positives, and 0 leakage
         self.passed_release_gate = (
-            self.defect_recall >= 1.0
+            self.total_cases >= max(1, min_cases)
+            and self.defect_recall >= 1.0
             and self.critical_defect_recall >= 1.0
             and self.false_positive_rate == 0.0
             and (self.adversarial_cases == 0 or self.adversarial_detection_rate >= 1.0)
+            and self.claim_support_precision >= 1.0
+            and self.repair_success_rate >= 1.0
+            and self.reproducibility_rate >= 1.0
+            and self.leakage_detected == 0
         )
         return self

@@ -33,7 +33,7 @@ class BenchmarkRunner:
     def __init__(self, config: Optional[AmauraConfig] = None):
         self.config = config or AmauraConfig()
 
-    def run_suite(self, cases: list[BenchmarkCase]) -> BenchmarkMetrics:
+    def run_suite(self, cases: list[BenchmarkCase], min_cases: int = 1) -> BenchmarkMetrics:
         metrics = BenchmarkMetrics()
         metrics.total_cases = len(cases)
 
@@ -67,4 +67,4 @@ class BenchmarkRunner:
                 else:
                     metrics.false_negatives += 1
 
-        return metrics.compute()
+        return metrics.compute(min_cases=min_cases)

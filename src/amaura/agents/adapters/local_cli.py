@@ -4,7 +4,7 @@ import hashlib
 import time
 from pathlib import Path
 
-from amaura.agents.base import AgentCapability, AgentRunResult, BaseAgentAdapter
+from amaura.agents.base import AgentCapability, AgentRunResult, AgentUsage, BaseAgentAdapter
 from amaura.errors import AdapterError
 from amaura.models.task import TaskSpec
 from amaura.security.process import run_agent_process
@@ -118,4 +118,10 @@ class LocalCLIAdapter(BaseAgentAdapter):
             output=proc_res.stdout,
             error_message=proc_res.stderr if proc_res.exit_code != 0 else None,
             execution_time_ms=duration_ms,
+            usage=AgentUsage(
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                estimated_cost_usd=0.0,
+            ),
         )
