@@ -1,0 +1,14 @@
+defects:
+  - id: "DEF-001"
+    name: "Unhandled IndexError on malformed CSV rows"
+    fixture: "examples/csv-import/version_b_crash_malformed"
+    severity: "critical"
+    category: "input_handling"
+    expected_verdict: "failed"
+
+  - id: "DEF-002"
+    name: "Verification gap: duplicate detection requirement untested"
+    fixture: "examples/csv-import/version_c_gap_duplicates"
+    severity: "high"
+    category: "test_quality"
+    expected_verdict: "failed"

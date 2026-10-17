@@ -1,0 +1,39 @@
+version = "0.1.0"
+default_agent = "artifact_only"
+runs_dir = ".amaura/runs"
+
+[policy]
+profile = "standard"
+require_clean_git = false
+fail_closed_on_timeout = true
+fail_closed_on_missing_check = true
+allow_vacuous_tests = false
+require_all_mandatory_acceptance_tests = true
+enforce_reproducibility = true
+
+[security]
+privacy_mode = "local_only"
+allow_network = false
+redact_secrets = true
+max_timeout_seconds = 60
+restricted_command_patterns = [
+    "rm -rf /",
+    "sudo",
+    "curl",
+    "wget",
+    "nc -e",
+    "chmod -R 777",
+    ":(){ :|:& };:",
+]
+forbidden_env_vars = [
+    "AWS_SECRET_ACCESS_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GITHUB_TOKEN",
+]
+
+[budget]
+default_timeout_seconds = 30
+max_checks_per_run = 50
+max_output_capture_bytes = 1000000
