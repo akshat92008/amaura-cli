@@ -60,9 +60,17 @@ class VerificationPlan:
             )
         )
 
-        # 4. Map each task requirement to an explicit acceptance check
+        # 4. Map each task requirement to an explicit acceptance check (D6: ensure unique check_ids)
+        used_check_ids = {c.check_id for c in checks}
         for req in self.task.requirements:
-            check_id = f"chk_req_{req.id.lower().replace('-', '_')}"
+            base_check_id = f"chk_req_{req.id.replace(' ', '_')}"
+            check_id = base_check_id
+            suffix = 1
+            while check_id in used_check_ids:
+                check_id = f"{base_check_id}_{suffix}"
+                suffix += 1
+            used_check_ids.add(check_id)
+
             checks.append(
                 CheckDefinition(
                     check_id=check_id,

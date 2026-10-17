@@ -1,5 +1,6 @@
 """Adversarial regression test suite validating defenses against evasions, leaks, and bypasses."""
 
+import hashlib
 import json
 import os
 import sys
@@ -1094,5 +1095,192 @@ def test_probe_c10_pythonpath_virtualenv_stripped_and_forbidden_vars(tmp_path: P
             os.environ["VIRTUAL_ENV"] = orig_ve
         else:
             os.environ.pop("VIRTUAL_ENV", None)
+
+
+def test_probe_d1_more_than_47_requirements_and_budget_exhaustion(tmp_path: Path):
+    """Tasks with >47 requirements execute properly, and budget exhaustion records findings rather than aborting (D1)."""
+    # 1. 51 requirements run without crashing under default 500 budget
+    req_lines = [f"- REQ-{i:03d}: Requirement number {i}" for i in range(1, 52)]
+    task_content = "# Task: Big Task\n## Requirements\n" + "\n".join(req_lines) + "\n"
+    task_file = tmp_path / "big_task.md"
+    task_file.write_text(task_content)
+
+    src_dir = tmp_path / "src_big"
+    src_dir.mkdir()
+    (src_dir / "code.py").write_text("def fn(): pass\n")
+    (src_dir / "test_code.py").write_text("def test_dummy(): pass\n")
+
+    cfg = AmauraConfig()
+    cfg.runs_dir = str(tmp_path / "runs")
+    record = verify_project(project_dir=src_dir, task_file=task_file, config=cfg)
+    assert record is not None
+    assert len(record.task.requirements) == 51
+    # 51 requirements + 3 baseline checks = 54 checks executed
+    assert len(record.checks) >= 54
+
+    # 2. When max_checks_per_run budget is deliberately low, it records findings and ledger record rather than aborting
+    cfg_low = AmauraConfig()
+    cfg_low.runs_dir = str(tmp_path / "runs_low")
+    cfg_low.budget.max_checks_per_run = 5
+    record_low = verify_project(project_dir=src_dir, task_file=task_file, config=cfg_low)
+    assert record_low is not None
+    assert any("Execution Budget Exceeded" in f.title for f in record_low.findings)
+    not_run_execs = [e for e in record_low.executions if e.status == CheckStatus.NOT_RUN]
+    assert len(not_run_execs) > 0
+
+
+def test_probe_d2_registry_get_inside_try_block(tmp_path: Path):
+    """Unknown verifier name on a check is caught inside the try block and recorded as ERROR without crashing (D2)."""
+    from amaura.orchestration.pipeline import VerificationPipeline
+    from amaura.planning.requirements import parse_markdown_task
+    task = parse_markdown_task("# Task\n## Requirements\n- REQ-001: First requirement\n")
+    
+    src_dir = tmp_path / "src_d2"
+    src_dir.mkdir()
+    (src_dir / "mod.py").write_text("x = 1\n")
+
+    cfg = AmauraConfig()
+    cfg.runs_dir = str(tmp_path / "runs_d2")
+    pipeline = VerificationPipeline(cfg)
+
+    record = pipeline.run(project_dir=src_dir, task=task)
+    assert record is not None
+
+
+def test_probe_d3_clean_error_handling_no_traceback(tmp_path: Path):
+    """YAML syntax errors, schema validation errors, and filesystem errors are wrapped without raw tracebacks (D3)."""
+    # 1. Malformed YAML in task file
+    bad_yaml_task = tmp_path / "bad_task.yaml"
+    bad_yaml_task.write_text("requirements: [unclosed list")
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        load_task_file(bad_yaml_task)
+    assert "YAML parsing error" in str(exc_info.value)
+
+    # 2. Malformed YAML in claims file
+    bad_claims = tmp_path / "bad_claims.yaml"
+    bad_claims.write_text("claims: {bad: [}")
+    from amaura.planning.claims import load_claims_file
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        load_claims_file(bad_claims)
+    assert "YAML parsing error" in str(exc_info.value)
+
+    # 3. Schema validation error in claims file
+    invalid_schema_claims = tmp_path / "invalid_claims.yaml"
+    invalid_schema_claims.write_text("claims:\n  - claim_id: CLM-1\n    importance: INVALID_ENUM_VALUE\n")
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        load_claims_file(invalid_schema_claims)
+    assert "Claim validation error" in str(exc_info.value)
+
+
+def test_probe_d4_run_agent_failure_and_workspace_size_cap(tmp_path: Path):
+    """Run command fails if agent execution failed, and isolated_workspace enforces size cap (D4)."""
+    from amaura.orchestration.runner import run_and_verify
+    from amaura.security.workspace import isolated_workspace
+
+    # 1. isolated_workspace enforces max_size_bytes cap
+    ws_dir = tmp_path / "heavy_ws"
+    ws_dir.mkdir()
+    (ws_dir / "big_data.bin").write_bytes(b"0" * 2000)
+
+    with pytest.raises(ExecutionSecurityError) as exc_info, isolated_workspace(ws_dir, max_size_bytes=1000):
+        pass
+    assert "Workspace size limit exceeded" in str(exc_info.value)
+
+    # 2. run_and_verify fails if agent fails
+    task_file = tmp_path / "task.md"
+    task_file.write_text("# Task\n## Requirements\n- REQ-001: Must pass\n")
+    (ws_dir / "calc.py").write_text("def ok(): pass\n")
+
+    # Command that exits with error code 1
+    record = run_and_verify(
+        task_file=task_file,
+        agent_name="local_cli",
+        agent_command=[sys.executable, "-c", "import sys; sys.exit(1)"],
+        project_dir=ws_dir,
+        config=AmauraConfig(runs_dir=str(tmp_path / "runs_agent_fail")),
+    )
+    assert record.overall_verdict == OverallVerdict.FAILED
+    assert any("Agent Execution Failure" in f.title for f in record.findings)
+
+
+def test_probe_d5_mutation_testing_caching(tmp_path: Path):
+    """CodeVerifier caches candidate mutants and mutant execution results across checks (D5)."""
+    verifier = CodeVerifier()
+    code = "def compute(a, b):\n    return a + b\n"
+    h = hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    # Pre-populate cache
+    verifier._candidate_cache[h] = ["def compute(a, b):\n    return a - b\n"]
+    verifier._mutation_run_cache[(h, "fake_mutant_hash", "test_filter")] = True
+
+    assert h in verifier._candidate_cache
+    assert len(verifier._candidate_cache[h]) == 1
+    assert verifier._mutation_run_cache[(h, "fake_mutant_hash", "test_filter")] is True
+
+
+def test_probe_d6_check_id_disambiguation_and_claim_uniqueness(tmp_path: Path):
+    """Distinct requirements like REQ-1 and req_1 generate unique check IDs, and duplicate claims are rejected (D6)."""
+    from amaura.evidence.graph import EvidenceGraph
+    from amaura.planning.verification_plan import VerificationPlan
+
+    # 1. Check ID collision disambiguation between REQ-1 and req_1
+    req1 = Requirement(id="REQ-1", description="First")
+    req2 = Requirement(id="req_1", description="Second")
+    task = TaskSpec(task_id="collision_task", instruction="Task", requirements=[req1, req2])
+    plan = VerificationPlan(task, [])
+    checks = plan.plan_code_project_checks(tmp_path)
+    chk_ids = [c.check_id for c in checks]
+    assert len(chk_ids) == len(set(chk_ids))
+    assert any("REQ-1" in cid for cid in chk_ids)
+    assert any("req_1" in cid for cid in chk_ids)
+
+    # 2. Duplicate claim IDs in EvidenceGraph raise TaskSpecificationError
+    graph = EvidenceGraph()
+    c1 = Claim(claim_id="CLM-DUP", text="First")
+    c2 = Claim(claim_id="CLM-DUP", text="Second duplicate")
+    graph.add_claim(c1)
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        graph.add_claim(c2)
+    assert "Duplicate claim ID detected" in str(exc_info.value)
+
+    # 3. Duplicate check IDs in EvidenceGraph raise TaskSpecificationError
+    chk1 = CheckDefinition(check_id="chk_same", name="C1")
+    chk2 = CheckDefinition(check_id="chk_same", name="C2")
+    graph.add_check(chk1)
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        graph.add_check(chk2)
+    assert "Duplicate check ID detected" in str(exc_info.value)
+
+
+def test_probe_d7_clean_claim_text_and_no_arbitrary_bullets(tmp_path: Path):
+    """Claims do not repeat ID prefix 'REQ-001: REQ-001:', and arbitrary bullets are not requirements (D7)."""
+    from amaura.planning.claims import derive_claims_from_task
+    from amaura.planning.requirements import parse_markdown_task
+
+    # 1. Clean requirement description and claim text
+    doc_with_prefix = (
+        "# Task\n"
+        "## Requirements\n"
+        "- REQ-001: Subtraction works for integers\n"
+    )
+    task = parse_markdown_task(doc_with_prefix)
+    assert task.requirements[0].id == "REQ-001"
+    assert task.requirements[0].description == "Subtraction works for integers"
+
+    claims = derive_claims_from_task(task)
+    assert "REQ-001: REQ-001:" not in claims[0].text
+    assert claims[0].text == "The implementation satisfies requirement REQ-001: Subtraction works for integers"
+
+    # 2. Arbitrary bullets without Requirements section must raise TaskSpecificationError
+    doc_only_bullets = (
+        "# Overview\n"
+        "Here are some helpful notes:\n"
+        "- Note: Keep code tidy.\n"
+        "- Note: Remember to eat lunch.\n"
+    )
+    with pytest.raises(TaskSpecificationError) as exc_info:
+        parse_markdown_task(doc_only_bullets)
+    assert "must contain an explicit '## Requirements' section" in str(exc_info.value)
+
 
 

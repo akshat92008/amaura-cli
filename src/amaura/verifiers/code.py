@@ -2,6 +2,7 @@
 
 import ast
 import copy
+import hashlib
 import re
 import sys
 import tempfile
@@ -358,6 +359,11 @@ class CodeVerifier(BaseVerifier):
     """Engine for validating code syntax, test execution, test quality/vacuousness, and acceptance tests."""
 
     name: str = "code"
+
+    def __init__(self, config=None):
+        super().__init__(config)
+        self._candidate_cache: dict[str, list[str]] = {}
+        self._mutation_run_cache: dict[tuple[str, str, str], bool] = {}
 
     def verify(
         self,
@@ -946,39 +952,53 @@ class CodeVerifier(BaseVerifier):
                     if mutant_killed:
                         break
                     original_code = src_p.read_text(encoding="utf-8")
-                    candidates = generate_candidate_mutants(original_code, max_mutants=5)
+                    src_hash = hashlib.sha256(original_code.encode("utf-8")).hexdigest()
+                    if src_hash in self._candidate_cache:
+                        candidates = self._candidate_cache[src_hash]
+                    else:
+                        candidates = generate_candidate_mutants(original_code, max_mutants=5)
+                        self._candidate_cache[src_hash] = candidates
+
                     for mutated_code in candidates:
                         mutant_tested = True
-                        try:
-                            # CRUCIAL (A4): Unlink stale XML before each mutant run to prevent stale report reuse
-                            junit_xml.unlink(missing_ok=True)
-                            src_p.write_text(mutated_code, encoding="utf-8")
-                            m_res = run_safe_process(
-                                command=cmd,
-                                cwd=project_dir,
-                                timeout_seconds=check.timeout_seconds,
-                                security_config=self.config.security,
-                                budget_config=self.config.budget,
-                            )
-                            m_failed = m_res.exit_code != 0 or m_res.timed_out
-                            if junit_xml.is_file():
-                                try:
-                                    m_root = safe_parse_xml(junit_xml)
-                                    m_suites = [m_root] if m_root.tag == "testsuite" else list(m_root.findall("testsuite"))
-                                    for s in m_suites:
-                                        if int(s.attrib.get("failures", 0)) > 0 or int(s.attrib.get("errors", 0)) > 0:
-                                            m_failed = True
-                                except Exception:
-                                    pass
+                        mutant_hash = hashlib.sha256(mutated_code.encode("utf-8")).hexdigest()
+                        cache_key = (src_hash, mutant_hash, k_filter)
 
-                            if "FAILED " in m_res.stdout or "ERROR " in m_res.stdout:
-                                m_failed = True
+                        if cache_key in self._mutation_run_cache:
+                            m_failed = self._mutation_run_cache[cache_key]
+                        else:
+                            try:
+                                # CRUCIAL (A4): Unlink stale XML before each mutant run to prevent stale report reuse
+                                junit_xml.unlink(missing_ok=True)
+                                src_p.write_text(mutated_code, encoding="utf-8")
+                                m_res = run_safe_process(
+                                    command=cmd,
+                                    cwd=project_dir,
+                                    timeout_seconds=check.timeout_seconds,
+                                    security_config=self.config.security,
+                                    budget_config=self.config.budget,
+                                )
+                                m_failed = m_res.exit_code != 0 or m_res.timed_out
+                                if junit_xml.is_file():
+                                    try:
+                                        m_root = safe_parse_xml(junit_xml)
+                                        m_suites = [m_root] if m_root.tag == "testsuite" else list(m_root.findall("testsuite"))
+                                        for s in m_suites:
+                                            if int(s.attrib.get("failures", 0)) > 0 or int(s.attrib.get("errors", 0)) > 0:
+                                                m_failed = True
+                                    except Exception:
+                                        pass
 
-                            if m_failed:
-                                mutant_killed = True
-                                break
-                        finally:
-                            src_p.write_text(original_code, encoding="utf-8")
+                                if "FAILED " in m_res.stdout or "ERROR " in m_res.stdout:
+                                    m_failed = True
+                            finally:
+                                src_p.write_text(original_code, encoding="utf-8")
+
+                            self._mutation_run_cache[cache_key] = m_failed
+
+                        if m_failed:
+                            mutant_killed = True
+                            break
 
                 if mutant_tested and not mutant_killed:
                     status = CheckStatus.FAILED

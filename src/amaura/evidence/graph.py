@@ -3,6 +3,7 @@
 
 from pydantic import BaseModel, Field
 
+from amaura.errors import TaskSpecificationError
 from amaura.models.check import CheckDefinition, CheckExecution
 from amaura.models.claim import Claim
 from amaura.models.evidence import EvidenceItem
@@ -30,9 +31,19 @@ class EvidenceGraph:
         self.findings: dict[str, Finding] = {}
 
     def add_claim(self, claim: Claim) -> None:
+        if claim.claim_id in self.claims:
+            raise TaskSpecificationError(
+                f"Duplicate claim ID detected in evidence graph: '{claim.claim_id}'. "
+                "Silent claim overwriting is strictly prohibited (D6)."
+            )
         self.claims[claim.claim_id] = claim
 
     def add_check(self, check: CheckDefinition) -> None:
+        if check.check_id in self.checks:
+            raise TaskSpecificationError(
+                f"Duplicate check ID detected in evidence graph: '{check.check_id}'. "
+                "Check IDs must be unique to ensure unambiguous tracking (D6)."
+            )
         self.checks[check.check_id] = check
 
     def add_execution(self, execution: CheckExecution) -> None:

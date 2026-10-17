@@ -50,9 +50,20 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
                 if text:
                     # Check for mandatory annotation
                     mandatory = not ("[advisory]" in text.lower() or "[optional]" in text.lower())
+                    clean_text = re.sub(r"(?i)\[(?:advisory|optional)\]", "", text).strip()
+
+                    # D7: Extract explicit requirement ID if present (e.g. REQ-001: Description)
+                    id_match = re.match(r"^((?:REQ[-_][A-Za-z0-9_-]+|[A-Za-z0-9]+[-_]\d+))\s*:\s*(.+)$", clean_text, re.IGNORECASE)
+                    if id_match:
+                        req_id = id_match.group(1).upper()
+                        req_desc = id_match.group(2).strip()
+                    else:
+                        req_id = f"REQ-{req_index:03d}"
+                        req_desc = clean_text
+
                     req = Requirement(
-                        id=f"REQ-{req_index:03d}",
-                        description=text,
+                        id=req_id,
+                        description=req_desc,
                         mandatory=mandatory,
                         risk_level=RiskLevel.HIGH if mandatory else RiskLevel.LOW,
                     )
@@ -79,25 +90,29 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
 
     instruction = "\n".join(instruction_lines).strip()
 
-    # If no explicit requirements section was found, parse top-level bullets as requirements
+    # D7: If no explicit requirements section was found, check ONLY for explicitly tagged REQ-... bullets
     if not requirements:
         for line in lines:
             s = line.strip()
-            if bullet_regex.match(s):
-                clean_text = strip_bullet_regex.sub("", s).strip()
-                if len(clean_text) > 5:
-                    requirements.append(
-                        Requirement(
-                            id=f"REQ-{len(requirements)+1:03d}",
-                            description=clean_text,
-                            mandatory=True,
-                            risk_level=RiskLevel.MEDIUM,
-                        )
+            # Must be an explicitly tagged requirement line, NOT arbitrary bullet point
+            m = re.match(r"^(?:[-*]|\d+\.)?\s*(REQ[-_][A-Za-z0-9_-]+)\s*:\s*(.+)$", s, re.IGNORECASE)
+            if m:
+                req_id = m.group(1).upper()
+                clean_desc = m.group(2).strip()
+                mandatory = not ("[advisory]" in clean_desc.lower() or "[optional]" in clean_desc.lower())
+                clean_desc = re.sub(r"(?i)\[(?:advisory|optional)\]", "", clean_desc).strip()
+                requirements.append(
+                    Requirement(
+                        id=req_id,
+                        description=clean_desc,
+                        mandatory=mandatory,
+                        risk_level=RiskLevel.HIGH if mandatory else RiskLevel.LOW,
                     )
+                )
 
     if not requirements:
         raise TaskSpecificationError(
-            "Task specification must contain at least one verifiable requirement. An empty requirement set cannot be verified."
+            "Task specification must contain an explicit '## Requirements' section or explicitly tagged requirements ('REQ-...:'). An empty or untagged requirement set cannot be verified."
         )
 
     task_id = Path(filename).stem
@@ -121,12 +136,20 @@ def load_task_file(task_path: Path, expected_hash: Optional[str] = None) -> Task
     suffix = task_path.suffix.lower()
 
     if suffix in {".yaml", ".yml"}:
-        data = yaml.safe_load(content)
+        try:
+            data = yaml.safe_load(content)
+        except Exception as e:
+            raise TaskSpecificationError(f"YAML parsing error in task file '{task_path.name}': {e}") from e
+
         if not isinstance(data, dict):
             raise TaskSpecificationError("YAML task specification must be a dictionary")
         if "task_hash" in data and not isinstance(data["task_hash"], str):
             data["task_hash"] = str(data["task_hash"])
-        task = TaskSpec.model_validate(data)
+        try:
+            task = TaskSpec.model_validate(data)
+        except Exception as e:
+            raise TaskSpecificationError(f"Task schema validation failed in '{task_path.name}': {e}") from e
+
         if not task.requirements:
             raise TaskSpecificationError("Task specification must contain at least one requirement.")
         canonical_hash = task.compute_hash()

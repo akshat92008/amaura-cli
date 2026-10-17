@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from amaura.config import AmauraConfig, PolicyProfile
+from amaura.errors import ExecutionSecurityError
 from amaura.evidence.collector import EvidenceCollector
 from amaura.evidence.graph import EvidenceGraph
 from amaura.evidence.hashing import compute_artifact_diff, create_directory_manifest
@@ -72,11 +73,26 @@ class VerificationPipeline:
         executions: list[CheckExecution] = []
         all_findings: list[Finding] = []
 
+        budget_exhausted = False
         for chk in checks:
-            governor.record_check_start()
-            verifier = self.registry.get(chk.verifier_name)
+            if budget_exhausted:
+                # D1: Record remaining checks cleanly as NOT_RUN instead of aborting without record
+                not_run_exec = CheckExecution(
+                    execution_id=f"exec_budget_{chk.check_id}",
+                    check_id=chk.check_id,
+                    status=CheckStatus.NOT_RUN,
+                    error_message="Skipped: Execution check budget reached",
+                    end_time=datetime.now(UTC).isoformat(),
+                )
+                executions.append(not_run_exec)
+                graph.add_execution(not_run_exec)
+                continue
 
             try:
+                # D1 & D2: governor and registry resolution inside try block
+                governor.record_check_start()
+                verifier = self.registry.get(chk.verifier_name)
+
                 res = verifier.verify(project_dir, chk, collector)
                 executions.append(res.execution)
                 graph.add_execution(res.execution)
@@ -88,8 +104,8 @@ class VerificationPipeline:
                     all_findings.append(f)
                     graph.add_finding(f)
 
-            except Exception as e:
-                # Fail-closed verifier crash handling
+            except ExecutionSecurityError as e:
+                # D1: Budget limit reached or execution security violation
                 err_exec = CheckExecution(
                     execution_id=f"exec_err_{chk.check_id}",
                     check_id=chk.check_id,
@@ -99,6 +115,59 @@ class VerificationPipeline:
                 )
                 executions.append(err_exec)
                 graph.add_execution(err_exec)
+
+                if "budget exceeded" in str(e).lower():
+                    budget_exhausted = True
+                    all_findings.append(
+                        Finding(
+                            finding_id=f"find_budget_{uuid.uuid4().hex[:8]}",
+                            check_id=chk.check_id,
+                            claim_id=chk.target_claim_id,
+                            title="Execution Budget Exceeded",
+                            description=str(e),
+                            finding_type=FindingType.VERIFICATION_GAP,
+                            severity=FindingSeverity.HIGH,
+                            is_blocking=True,
+                        )
+                    )
+                else:
+                    all_findings.append(
+                        Finding(
+                            finding_id=f"find_err_{uuid.uuid4().hex[:8]}",
+                            check_id=chk.check_id,
+                            claim_id=chk.target_claim_id,
+                            title=f"Security Violation During Check ({chk.name})",
+                            description=str(e),
+                            finding_type=FindingType.SECURITY_RISK,
+                            severity=FindingSeverity.CRITICAL,
+                            is_blocking=True,
+                        )
+                    )
+
+            except Exception as e:
+                # Fail-closed verifier crash handling (D2)
+                err_exec = CheckExecution(
+                    execution_id=f"exec_err_{chk.check_id}",
+                    check_id=chk.check_id,
+                    status=CheckStatus.ERROR,
+                    error_message=str(e),
+                    end_time=datetime.now(UTC).isoformat(),
+                )
+                executions.append(err_exec)
+                graph.add_execution(err_exec)
+
+                all_findings.append(
+                    Finding(
+                        finding_id=f"find_err_{uuid.uuid4().hex[:8]}",
+                        check_id=chk.check_id,
+                        claim_id=chk.target_claim_id,
+                        title=f"Check Execution Failure ({chk.name})",
+                        description=f"Verifier error during '{chk.name}': {e!s}",
+                        finding_type=FindingType.VERIFICATION_GAP,
+                        severity=FindingSeverity.HIGH,
+                        is_blocking=True,
+                    )
+                )
 
         # 6. Apply deterministic verdict policy
         policy_cfg = self.config.policy.model_copy()

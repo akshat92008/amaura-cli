@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Optional
 
 import typer
+import yaml  # type: ignore[import-untyped]
+from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -157,6 +159,23 @@ def agents():
     console.print(table)
 
 
+def _handle_cli_error(cmd_name: str, exc: Exception) -> None:
+    """Handles exceptions in CLI commands cleanly without raw tracebacks (D3)."""
+    if isinstance(exc, typer.Exit):
+        raise exc
+    if isinstance(exc, AmauraError):
+        console.print(f"[red]{cmd_name} Error:[/red] {exc.message}")
+    elif isinstance(exc, (shutil.Error, OSError)):
+        console.print(f"[red]{cmd_name} Filesystem Error:[/red] {exc}")
+    elif isinstance(exc, ValidationError):
+        console.print(f"[red]{cmd_name} Schema Validation Error:[/red] {exc}")
+    elif isinstance(exc, yaml.YAMLError):
+        console.print(f"[red]{cmd_name} YAML Syntax Error:[/red] {exc}")
+    else:
+        console.print(f"[red]{cmd_name} Execution Error:[/red] {exc}")
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def verify(
     path: Path = typer.Argument(Path("."), help="Path to project directory to verify"),
@@ -184,9 +203,8 @@ def verify(
             raise typer.Exit(code=1)
         elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
             raise typer.Exit(code=2)
-    except AmauraError as exc:
-        console.print(f"[red]Verification Error:[/red] {exc.message}")
-        raise typer.Exit(code=1)
+    except Exception as exc:
+        _handle_cli_error("Verification", exc)
 
 
 @app.command()
@@ -211,9 +229,8 @@ def audit(
             raise typer.Exit(code=1)
         elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
             raise typer.Exit(code=2)
-    except AmauraError as exc:
-        console.print(f"[red]Audit Error:[/red] {exc.message}")
-        raise typer.Exit(code=1)
+    except Exception as exc:
+        _handle_cli_error("Audit", exc)
 
 
 @app.command(name="claim-check")
@@ -229,9 +246,8 @@ def claim_check(
             raise typer.Exit(code=1)
         elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
             raise typer.Exit(code=2)
-    except AmauraError as exc:
-        console.print(f"[red]Claim-Check Error:[/red] {exc.message}")
-        raise typer.Exit(code=1)
+    except Exception as exc:
+        _handle_cli_error("Claim-Check", exc)
 
 
 @app.command()
@@ -252,9 +268,8 @@ def report(
             title="Evidence Integrity Error",
         ))
         raise typer.Exit(code=1)
-    except AmauraError as exc:
-        console.print(f"[red]Error loading run:[/red] {exc.message}")
-        raise typer.Exit(code=1)
+    except Exception as exc:
+        _handle_cli_error("Report", exc)
 
     if not record:
         console.print(f"[red]Run '{run_id}' not found in ledger at {ledger.runs_dir}[/red]")
@@ -474,9 +489,8 @@ def run(
             raise typer.Exit(code=1)
         elif record.overall_verdict == OverallVerdict.INCONCLUSIVE:
             raise typer.Exit(code=2)
-    except AmauraError as exc:
-        console.print(f"[red]Run Error:[/red] {exc.message}")
-        raise typer.Exit(code=1)
+    except Exception as exc:
+        _handle_cli_error("Run", exc)
 
 
 def _print_run_summary(record, show_evidence: bool = False):

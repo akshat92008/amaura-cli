@@ -49,8 +49,9 @@ class SecurityConfig(BaseModel):
 
 class BudgetConfig(BaseModel):
     default_timeout_seconds: int = 30
-    max_checks_per_run: int = 50
+    max_checks_per_run: int = 500
     max_output_capture_bytes: int = 1_000_000  # 1MB limit per stream
+    max_workspace_bytes: int = 100 * 1024 * 1024  # 100MB directory copy limit (D4)
 
 
 class VerificationPolicyConfig(BaseModel):

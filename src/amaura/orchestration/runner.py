@@ -1,5 +1,6 @@
 """High-level runner APIs orchestrating verification, claim checks, and agent runs."""
 
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -8,7 +9,8 @@ from amaura.agents.registry import AgentRegistry
 from amaura.config import AmauraConfig, PolicyProfile
 from amaura.errors import ExecutionSecurityError
 from amaura.evidence.hashing import create_directory_manifest, verify_manifest_integrity
-from amaura.models.run import RunMode, RunRecord
+from amaura.models.finding import Finding, FindingSeverity, FindingType
+from amaura.models.run import OverallVerdict, RunMode, RunRecord
 from amaura.models.task import TaskSpec
 from amaura.orchestration.pipeline import VerificationPipeline
 from amaura.planning.claims import load_claims_file
@@ -139,7 +141,7 @@ def run_and_verify(
     if isinstance(adapter, LocalCLIAdapter) and agent_command:
         adapter.cli_command = agent_command
 
-    with isolated_workspace(base_dir) as ws:
+    with isolated_workspace(base_dir, max_size_bytes=cfg.budget.max_workspace_bytes) as ws:
         # Run agent
         agent_res = adapter.execute(task, ws)
 
@@ -153,5 +155,21 @@ def run_and_verify(
             policy_override=policy_profile,
             extra_limitations=[f"Agent '{agent_name}' result: success={agent_res.success}"],
         )
+
+        # D4: Do not ignore agent failure
+        if not agent_res.success:
+            record.findings.append(
+                Finding(
+                    finding_id=f"find_agent_err_{uuid.uuid4().hex[:8]}",
+                    check_id="chk_agent_execution",
+                    title="Agent Execution Failure",
+                    description=f"Agent '{agent_name}' failed to complete task: {agent_res.error_message or agent_res.output or 'exit code non-zero'}",
+                    finding_type=FindingType.DEFECT,
+                    severity=FindingSeverity.CRITICAL,
+                    is_blocking=True,
+                )
+            )
+            record.overall_verdict = OverallVerdict.FAILED
+            record.verdict_reasons.append(f"Agent '{agent_name}' execution failed (success=False).")
 
     return record
