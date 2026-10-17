@@ -680,22 +680,29 @@ def replay(
 
 @app.command()
 def benchmark(
-    suite: str = typer.Option("all", "--suite", "-s", help="Benchmark suite to execute (all, csv, known_good, known_bad)"),
+    suite: str = typer.Option("all", "--suite", "-s", help="Benchmark suite to execute (all, csv, known_good, known_bad, holdout, adversarial)"),
 ):
-    """Evaluate Amaura verification against standard defect fixtures and release gates (E3)."""
+    """Evaluate Amaura verification against standard defect fixtures and release gates (E3, G1-G6)."""
     cfg = AmauraConfig.load(start_dir=Path.cwd())
-    base_dir = Path(__file__).resolve().parents[2]
-    csv_example = base_dir / "examples" / "csv-import"
-    task_file = csv_example / "task.md"
+
+    # G4: Locate packaged fixtures first, falling back to repository examples
+    packaged_dir = Path(__file__).resolve().parent / "benchmarks" / "fixtures"
+    repo_dir = Path(__file__).resolve().parents[2] / "examples" / "csv-import"
+
+    csv_dir = packaged_dir / "csv-import" if (packaged_dir / "csv-import").exists() else repo_dir
+    holdout_dir = packaged_dir / "holdout"
+    adversarial_dir = packaged_dir / "adversarial"
 
     cases: list[BenchmarkCase] = []
 
-    if csv_example.exists():
+    # 1. Standard CSV Import fixtures
+    if csv_dir.exists():
+        task_file = csv_dir / "task.md"
         # Version A: Known Good
         cases.append(
             BenchmarkCase(
                 name="CSV Import (Version A - Correct)",
-                path=csv_example / "version_a_correct",
+                path=csv_dir / "version_a_correct",
                 task_file=task_file,
                 expected_verdict=OverallVerdict.PASSED,
                 category="known_good",
@@ -705,34 +712,86 @@ def benchmark(
         cases.append(
             BenchmarkCase(
                 name="CSV Import (Version B - Crash Malformed)",
-                path=csv_example / "version_b_crash_malformed",
+                path=csv_dir / "version_b_crash_malformed",
                 task_file=task_file,
                 expected_verdict=OverallVerdict.FAILED,
                 is_critical_defect=True,
                 category="known_bad",
             )
         )
-        # Version C: Test Gap (Duplicate requirement untested)
+        # Version C: Test Gap (Duplicate requirement untested) - Fails closed (G2)
         cases.append(
             BenchmarkCase(
                 name="CSV Import (Version C - Duplicate Test Gap)",
-                path=csv_example / "version_c_gap_duplicates",
+                path=csv_dir / "version_c_gap_duplicates",
                 task_file=task_file,
-                expected_verdict=OverallVerdict.INCONCLUSIVE,
+                expected_verdict=OverallVerdict.FAILED,
                 category="known_bad",
             )
         )
 
-    # Filter cases by suite (E3)
+    # 2. Holdout fixtures (G3)
+    if holdout_dir.exists():
+        holdout_task = holdout_dir / "task.md"
+        cases.append(
+            BenchmarkCase(
+                name="Holdout Calculator (Correct Implementation)",
+                path=holdout_dir / "holdout_correct_calc",
+                task_file=holdout_task,
+                expected_verdict=OverallVerdict.PASSED,
+                category="holdout",
+            )
+        )
+        cases.append(
+            BenchmarkCase(
+                name="Holdout Calculator (Critical Subtraction Defect)",
+                path=holdout_dir / "holdout_broken_calc",
+                task_file=holdout_task,
+                expected_verdict=OverallVerdict.FAILED,
+                is_critical_defect=True,
+                category="holdout",
+            )
+        )
+
+    # 3. Adversarial evasion fixtures (G3)
+    if adversarial_dir.exists():
+        adv_task = adversarial_dir / "task.md"
+        cases.append(
+            BenchmarkCase(
+                name="Adversarial Evasion (Vacuous Assert True Test)",
+                path=adversarial_dir / "adversarial_vacuous_test",
+                task_file=adv_task,
+                expected_verdict=OverallVerdict.FAILED,
+                category="adversarial",
+            )
+        )
+        cases.append(
+            BenchmarkCase(
+                name="Adversarial Evasion (Conftest Exit-Code Hijack Attempt)",
+                path=adversarial_dir / "adversarial_hook_hijack",
+                task_file=adv_task,
+                expected_verdict=OverallVerdict.FAILED,
+                is_critical_defect=True,
+                category="adversarial",
+            )
+        )
+
+    # Filter cases by suite (E3, G3)
     suite_clean = suite.strip().lower()
-    if suite_clean in ("all", "csv", "csv-import", "csv_import"):
+    if suite_clean in ("all", "full"):
         filtered_cases = cases
+    elif suite_clean in ("csv", "csv-import", "csv_import"):
+        filtered_cases = [c for c in cases if "CSV" in c.name]
     elif suite_clean in ("known_good", "good"):
-        filtered_cases = [c for c in cases if c.category == "known_good"]
+        filtered_cases = [c for c in cases if c.expected_verdict == OverallVerdict.PASSED]
     elif suite_clean in ("known_bad", "bad"):
-        filtered_cases = [c for c in cases if c.category == "known_bad"]
+        filtered_cases = [c for c in cases if c.expected_verdict != OverallVerdict.PASSED and c.category == "known_bad"]
+    elif suite_clean in ("holdout", "holdouts"):
+        filtered_cases = [c for c in cases if c.category == "holdout"]
+    elif suite_clean in ("adversarial", "adversary", "evasion"):
+        filtered_cases = [c for c in cases if c.category == "adversarial"]
     else:
-        console.print(f"[red]Error: Unknown benchmark suite '{escape(suite)}'. Available suites: all, csv, known_good, known_bad[/red]")
+        console.print(f"[red]Error: Unknown benchmark suite '{escape(suite)}'. Available suites: all, csv, known_good, known_bad, holdout, adversarial[/red]")
         raise typer.Exit(code=1)
 
     if not filtered_cases:
@@ -751,6 +810,16 @@ def benchmark(
     table.add_row("Defect Recall", f"{metrics.defect_recall * 100:.1f}%", "100.0%")
     table.add_row("Critical Defect Recall", f"{metrics.critical_defect_recall * 100:.1f}%", "100.0%")
     table.add_row("False Positive Rate", f"{metrics.false_positive_rate * 100:.1f}%", "0.0%")
+    if metrics.adversarial_cases > 0:
+        table.add_row("Adversarial Evasion Detection", f"{metrics.adversarial_detection_rate * 100:.1f}%", "100.0%")
+
+    # Extended reliability metrics (G6)
+    table.add_row("Claim-Support Precision", f"{metrics.claim_support_precision * 100:.1f}%", "100.0%")
+    table.add_row("Repair Success Rate", f"{metrics.repair_success_rate * 100:.1f}%", "100.0%")
+    table.add_row("Reproducibility Rate", f"{metrics.reproducibility_rate * 100:.1f}%", "100.0%")
+    table.add_row("Total Verification Cost (USD)", f"${metrics.total_cost_usd:.4f}", "$0.0000")
+    table.add_row("Secret/Env Leakage Detected", str(metrics.leakage_detected), "0")
+
     gate_status = "[green]PASSED[/green]" if metrics.passed_release_gate else "[red]FAILED[/red]"
     table.add_row("Release Gate Status", gate_status, "Must Pass")
 
@@ -762,6 +831,7 @@ def benchmark(
 @app.command()
 def run(
     task: Path = typer.Argument(..., help="Path to task markdown file"),
+    project: Optional[Path] = typer.Option(None, "--project", help="Target project workspace"),
     agent: str = typer.Option("artifact_only", "--agent", "-a", help="Agent adapter to operate"),
     agent_cmd: Optional[str] = typer.Option(None, "--agent-cmd", help="CLI command to execute when using local_cli agent"),
     expected_hash: Optional[str] = typer.Option(None, "--expected-hash", help="Expected SHA-256 hash of task specification"),
@@ -785,6 +855,7 @@ def run(
             agent_name=agent,
             agent_command=agent_command,
             expected_hash=expected_hash,
+            project_dir=project,
             policy_profile=profile,
             config=cfg,
         )

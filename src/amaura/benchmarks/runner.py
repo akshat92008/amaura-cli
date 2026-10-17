@@ -40,15 +40,20 @@ class BenchmarkRunner:
         for case in cases:
             rec = verify_project(project_dir=case.path, task_file=case.task_file, config=self.config)
 
-            if case.category == "known_good":
+            if case.expected_verdict == OverallVerdict.PASSED:
                 metrics.known_good_cases += 1
                 if rec.overall_verdict == case.expected_verdict:
                     metrics.true_negatives += 1
                 else:
                     metrics.false_positives += 1
 
-            elif case.category in ("known_bad", "holdout", "adversarial"):
+            else:
                 metrics.known_bad_cases += 1
+                if case.category == "holdout":
+                    metrics.holdout_cases += 1
+                elif case.category == "adversarial":
+                    metrics.adversarial_cases += 1
+
                 if case.is_critical_defect:
                     metrics.critical_defects_total += 1
 
@@ -57,6 +62,8 @@ class BenchmarkRunner:
                     metrics.true_positives += 1
                     if case.is_critical_defect:
                         metrics.critical_defects_detected += 1
+                    if case.category == "adversarial":
+                        metrics.adversarial_detected += 1
                 else:
                     metrics.false_negatives += 1
 

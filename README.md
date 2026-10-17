@@ -24,7 +24,7 @@ Amaura is built in Python 3 (>= 3.11) with Typer and Pydantic:
 
 ```bash
 # Clone the repository
-git clone https://github.com/amaura-labs/amaura-cli.git
+git clone https://github.com/akshat92008/amaura-cli.git
 cd amaura-cli
 
 # Install dependencies using uv or pip
@@ -88,7 +88,7 @@ Amaura includes three benchmark versions of a CSV importer fixture (`examples/cs
 
 - **Version A (Correct)**: Fully satisfies valid parsing, duplicate detection, and malformed input rejection. **Verdict: PASSED**
 - **Version B (Crash on Malformed Input)**: Works on ordinary files but crashes with an unhandled `IndexError` when malformed rows are passed. **Verdict: FAILED** (Catches critical defect).
-- **Version C (Verification Gap)**: Tests pass, but tests never test duplicate detection. **Verdict: FAILED / INCONCLUSIVE** (Detects untested mandatory requirement).
+- **Version C (Verification Gap)**: Tests pass, but tests never test duplicate detection. **Verdict: FAILED** (Detects untested mandatory requirement; fails closed).
 
 ---
 

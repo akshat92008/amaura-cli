@@ -3,6 +3,7 @@
 import ast
 import copy
 import hashlib
+import os
 import re
 import sys
 import tempfile
@@ -477,6 +478,19 @@ class CodeVerifier(BaseVerifier):
             findings=findings,
         )
 
+    def _find_python_executable(self, project_dir: Path) -> str:
+        """Finds the appropriate Python executable for testing the target project.
+        Prefers target's virtual environment if present, falling back to sys.executable (H1).
+        """
+        for venv_name in (".venv", "venv", "env"):
+            venv_py = project_dir / venv_name / "bin" / "python"
+            if venv_py.is_file() and os.access(venv_py, os.X_OK):
+                return str(venv_py)
+            venv_py_win = project_dir / venv_name / "Scripts" / "python.exe"
+            if venv_py_win.is_file():
+                return str(venv_py_win)
+        return sys.executable
+
     def _verify_tests(
         self,
         project_dir: Path,
@@ -490,9 +504,10 @@ class CodeVerifier(BaseVerifier):
         with tempfile.TemporaryDirectory() as tmp_dir:
             junit_xml = Path(tmp_dir) / "junit_report.xml"
 
-            # Execute pytest writing machine-readable JUnit XML report
+            # Execute pytest writing machine-readable JUnit XML report (-B prevents bytecode caching)
             cmd = [
-                sys.executable,
+                self._find_python_executable(project_dir),
+                "-B",
                 "-m",
                 "pytest",
                 "-v",
@@ -894,7 +909,8 @@ class CodeVerifier(BaseVerifier):
         with tempfile.TemporaryDirectory() as tmp_dir:
             junit_xml = Path(tmp_dir) / "junit_report.xml"
             cmd = [
-                sys.executable,
+                self._find_python_executable(project_dir),
+                "-B",
                 "-m",
                 "pytest",
                 "-v",
@@ -972,12 +988,18 @@ class CodeVerifier(BaseVerifier):
                                 # CRUCIAL (A4): Unlink stale XML before each mutant run to prevent stale report reuse
                                 junit_xml.unlink(missing_ok=True)
                                 src_p.write_text(mutated_code, encoding="utf-8")
+                                for pyc in project_dir.rglob("*.pyc"):
+                                    try:
+                                        pyc.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
                                 m_res = run_safe_process(
                                     command=cmd,
                                     cwd=project_dir,
                                     timeout_seconds=check.timeout_seconds,
                                     security_config=self.config.security,
                                     budget_config=self.config.budget,
+                                    env={"PYTHONDONTWRITEBYTECODE": "1"},
                                 )
                                 m_failed = m_res.exit_code != 0 or m_res.timed_out
                                 if junit_xml.is_file():
@@ -994,6 +1016,11 @@ class CodeVerifier(BaseVerifier):
                                     m_failed = True
                             finally:
                                 src_p.write_text(original_code, encoding="utf-8")
+                                for pyc in project_dir.rglob("*.pyc"):
+                                    try:
+                                        pyc.unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
 
                             self._mutation_run_cache[cache_key] = m_failed
 

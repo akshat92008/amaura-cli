@@ -87,6 +87,7 @@ def run_safe_process(
     clean_env["HOME"] = str(sandbox_home)
     clean_env["USERPROFILE"] = str(sandbox_home)
     clean_env["TMPDIR"] = str(sandbox_home)
+    clean_env["PYTHONDONTWRITEBYTECODE"] = "1"
 
     # 4. Enforce offline behavior flags, proxy dead-ends, and socket connect interception (C1, C2)
     resolved_cwd = cwd.resolve()
@@ -294,7 +295,8 @@ os.mkdir = _safe_mkdir
         timed_out = False
         exceeded_size = False
 
-        rlist = [proc.stdout, proc.stderr]
+        from typing import Any
+        rlist: list[Any] = [p for p in (proc.stdout, proc.stderr) if p is not None]
         deadline = start_t + effective_timeout
 
         # Bounded streaming read loop without buffering unbounded output into RAM (C5)

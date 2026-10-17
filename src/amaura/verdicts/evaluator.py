@@ -222,11 +222,11 @@ class VerdictEvaluator:
             for chk in timed_out_non_mandatory_checks:
                 reasons.append(f"Strict policy failure: Non-mandatory check timed out: '{chk}'")
 
-        # Case D: Missing mandatory checks or untested requirement gaps (Default/Permissive -> INCONCLUSIVE)
+        # Case D: Missing mandatory checks or untested requirement gaps (fail-closed if configured)
         elif missing_mandatory_checks or gap_findings:
-            if missing_mandatory_checks and getattr(self.policy.config, "fail_closed_on_missing_check", True) and self.policy.profile == PolicyProfile.STRICT:
+            if missing_mandatory_checks and getattr(self.policy.config, "fail_closed_on_missing_check", True):
                 overall = OverallVerdict.FAILED
-                reasons.append(f"Strict policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
+                reasons.append(f"Fail-closed policy failure: Missing mandatory checks: {', '.join(missing_mandatory_checks)}")
             else:
                 overall = OverallVerdict.INCONCLUSIVE
                 if missing_mandatory_checks:
