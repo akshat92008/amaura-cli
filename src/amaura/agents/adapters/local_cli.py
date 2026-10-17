@@ -58,8 +58,9 @@ class LocalCLIAdapter(BaseAgentAdapter):
     execution_mode = "subcommand_isolated"
     limitations = ["Depends on host installation and tool CLI interface."]
 
-    def __init__(self, cli_command: list[str] | None = None):
+    def __init__(self, cli_command: list[str] | None = None, timeout_seconds: int = 120):
         self.cli_command = cli_command
+        self.timeout_seconds = timeout_seconds
 
     def execute(self, task: TaskSpec, workspace_dir: Path) -> AgentRunResult:
         if not self.cli_command:
@@ -100,7 +101,7 @@ class LocalCLIAdapter(BaseAgentAdapter):
             command=formatted_cmd,
             cwd=workspace_dir,
             env=env,
-            timeout_seconds=60,
+            timeout_seconds=self.timeout_seconds,
         )
         duration_ms = int((time.perf_counter() - start_t) * 1000)
 

@@ -145,3 +145,17 @@ The release gate enforces reliability across a battery of test suites:
 - False Positive Rate: `0.0%`
 - Adversarial Evasion Detection: `100.0%`
 - Gate Status: `PASSED`
+
+---
+
+## 5. Milestone Implementation Status & Roadmap
+
+Amaura maintains strict transparency between verified capabilities and roadmap milestones:
+
+- **M0 (Verification Kernel - Completed)**: Independent check runners, evidence graph, cryptographic SHA-256 ledger chaining, and fail-closed 3-state verdict engine.
+- **M1 (Agent Adapters - Foundational)**: Standardized adapter interfaces (`artifact_only`, `local_cli`, `model`), usage tracking, and timeout guards. Autonomous multi-turn agent execution loops remain roadmap.
+- **M2 (Adversarial Evasion & Test Hardening - Completed Core)**: Terminal stdout cross-checking against JUnit XML, AST detection of hostile conftest hooks, vacuous test identification, and bytecode-isolated mutation testing. Automated iterative code repair is roadmap.
+- **M3 (Local-First Privacy & OS Sandbox - Completed Core)**: OS-level kernel isolation via `sandbox-exec` (Darwin) and `bwrap`/`unshare` (Linux), outbound socket blocking in local mode, workspace boundary containment, and externalized ledger anchor keys (`~/.amaura/ledger_anchor.key`).
+- **M4 (Multi-Domain Verifiers - Foundational)**: Syntactic verification across code AST, CSV data schemas, and mathematical calculations. Deep NLP-based citation verification and automated ontology lookups remain roadmap.
+- **M5 (Reliability Benchmark Release Gate - Completed)**: Full automated test harness validating 100% defect recall, 100% critical recall, 0% false positives, and 100% reproducibility across known-good, known-bad, holdout, and adversarial suites.
+

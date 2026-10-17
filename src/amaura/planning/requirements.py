@@ -61,11 +61,20 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
                         req_id = f"REQ-{req_index:03d}"
                         req_desc = clean_text
 
+                    # Extract explicit acceptance test criteria if specified (e.g. (acceptance: test_valid_import))
+                    acc_match = re.search(r"[\(\[](?:acceptance|test|tests):\s*([^\)\]]+)[\)\]]", req_desc, re.IGNORECASE)
+                    acc_criteria: list[str] = []
+                    if acc_match:
+                        raw_tests = acc_match.group(1)
+                        acc_criteria = [t.strip() for t in raw_tests.split(",") if t.strip()]
+                        req_desc = (req_desc[:acc_match.start()] + req_desc[acc_match.end():]).strip()
+
                     req = Requirement(
                         id=req_id,
                         description=req_desc,
                         mandatory=mandatory,
                         risk_level=RiskLevel.HIGH if mandatory else RiskLevel.LOW,
+                        acceptance_criteria=acc_criteria,
                     )
                     requirements.append(req)
                     req_index += 1
@@ -101,12 +110,20 @@ def parse_markdown_task(content: str, filename: str = "task.md") -> TaskSpec:
                 clean_desc = m.group(2).strip()
                 mandatory = not ("[advisory]" in clean_desc.lower() or "[optional]" in clean_desc.lower())
                 clean_desc = re.sub(r"(?i)\[(?:advisory|optional)\]", "", clean_desc).strip()
+                acc_match = re.search(r"[\(\[](?:acceptance|test|tests):\s*([^\)\]]+)[\)\]]", clean_desc, re.IGNORECASE)
+                acc_criteria = []
+                if acc_match:
+                    raw_tests = acc_match.group(1)
+                    acc_criteria = [t.strip() for t in raw_tests.split(",") if t.strip()]
+                    clean_desc = (clean_desc[:acc_match.start()] + clean_desc[acc_match.end():]).strip()
+
                 requirements.append(
                     Requirement(
                         id=req_id,
                         description=clean_desc,
                         mandatory=mandatory,
                         risk_level=RiskLevel.HIGH if mandatory else RiskLevel.LOW,
+                        acceptance_criteria=acc_criteria,
                     )
                 )
 

@@ -1,7 +1,9 @@
 """Safe isolated subprocess execution with process group cleanup and strict environment allowlists."""
 
 import os
+import platform
 import select
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -37,6 +39,77 @@ class ProcessResult(BaseModel):
     duration_ms: int
     timed_out: bool = False
     error: Optional[str] = None
+
+
+def build_kernel_isolation_command(
+    cmd_parts: list[str],
+    cwd: Path,
+    sandbox_home: Path,
+    allowed_roots: list[str],
+    sensitive_paths: list[str],
+    security_config: SecurityConfig,
+) -> list[str]:
+    """Wraps process command line with OS-level kernel isolation (sandbox-exec on Darwin, bwrap/unshare on Linux)."""
+    os_type = platform.system().lower()
+
+    if os_type == "darwin" and shutil.which("sandbox-exec"):
+        profile_rules = [
+            "(version 1)",
+            "(allow default)",
+        ]
+        # 1. Kernel Network Denial (C1, Rule 9)
+        if security_config.privacy_mode.value == "local_only" or not security_config.allow_network:
+            profile_rules.append("(deny network*)")
+
+        # 2. Kernel Sensitive Host Path Read Denial (C2, Rule 8)
+        for sp in sensitive_paths:
+            sp_res = str(Path(sp).resolve())
+            profile_rules.append(f'(deny file-read* (subpath "{sp_res}"))')
+            if sp_res.startswith("/private/"):
+                sym = sp_res.replace("/private", "")
+                profile_rules.append(f'(deny file-read* (subpath "{sym}"))')
+            elif sp_res.startswith("/etc/"):
+                profile_rules.append(f'(deny file-read* (subpath "/private{sp_res}"))')
+
+        # 3. Kernel Filesystem Write Restrictions (C2, Rule 8)
+        profile_rules.append("(deny file-write*)")
+        for ar in allowed_roots:
+            ar_res = str(Path(ar).resolve())
+            profile_rules.append(f'(allow file-write* (subpath "{ar_res}"))')
+            if ar_res.startswith("/private/"):
+                profile_rules.append(f'(allow file-write* (subpath "{ar_res.replace("/private", "")}"))')
+
+        # Allow writes to standard dev outputs and designated temp subpaths
+        profile_rules.append('(allow file-write* (subpath "/dev"))')
+        profile_rules.append('(allow file-write* (subpath "/private/var/folders"))')
+        profile_rules.append('(allow file-write* (subpath "/var/folders"))')
+
+        profile_str = "".join(profile_rules)
+        return ["/usr/bin/sandbox-exec", "-p", profile_str] + cmd_parts
+
+    elif os_type == "linux":
+        bwrap = shutil.which("bwrap")
+        if bwrap:
+            bwrap_cmd = [
+                bwrap,
+                "--ro-bind", "/", "/",
+                "--dev", "/dev",
+                "--proc", "/proc",
+                "--tmpfs", "/tmp",
+            ]
+            if security_config.privacy_mode.value == "local_only" or not security_config.allow_network:
+                bwrap_cmd.append("--unshare-net")
+            for ar in allowed_roots:
+                ar_p = str(Path(ar).resolve())
+                bwrap_cmd.extend(["--bind", ar_p, ar_p])
+            for sp in sensitive_paths:
+                sp_p = str(Path(sp).resolve())
+                bwrap_cmd.extend(["--tmpfs", sp_p])
+            return bwrap_cmd + ["--"] + cmd_parts
+        elif shutil.which("unshare") and (security_config.privacy_mode.value == "local_only" or not security_config.allow_network):
+            return ["unshare", "-rn"] + cmd_parts
+
+    return cmd_parts
 
 
 def run_safe_process(
@@ -274,11 +347,20 @@ os.mkdir = _safe_mkdir
         except Exception:
             pass
 
+    exec_cmd = build_kernel_isolation_command(
+        cmd_parts=cmd_parts,
+        cwd=resolved_cwd,
+        sandbox_home=sandbox_home,
+        allowed_roots=allowed_roots,
+        sensitive_paths=sensitive_host_paths,
+        security_config=sec,
+    )
+
     start_t = time.perf_counter()
     proc: Optional[subprocess.Popen] = None
     try:
         proc = subprocess.Popen(
-            cmd_parts,
+            exec_cmd,
             cwd=str(resolved_cwd),
             env=clean_env,
             stdout=subprocess.PIPE,

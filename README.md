@@ -107,6 +107,19 @@ Amaura includes three benchmark versions of a CSV importer fixture (`examples/cs
 
 ---
 
+## Milestone Status & Verification Guarantees
+
+| Milestone | Scope & Description | Status | Verification Evidence |
+|---|---|---|---|
+| **M0: Verification Kernel** | Core deterministic check runner, evidence collection, cryptographic ledger, and fail-closed verdict resolution (PASSED, FAILED, INCONCLUSIVE). | **Completed** | Full test coverage; 3-state resolution; SHA-256 chain. |
+| **M1: Agent Adapter Contract** | Pluggable agent interfaces (`artifact_only`, `local_cli`, `model`), timeout handling, and cost/usage accounting. | **Foundational** | Contract tests pass; autonomous orchestration loop is roadmap. |
+| **M2: Adversarial Hardening** | Terminal/JUnit cross-check, conftest hook detection, AST vacuous test analysis, and mutation testing. | **Completed (Core)** | Evasion detection 100%; multi-turn repair loop is roadmap. |
+| **M3: Local-First Privacy & OS Sandbox** | Kernel sandboxing (`sandbox-exec` / `bwrap`), network kill-switch, path containment, and secret redaction. | **Completed (Core)** | Zero network leak; host root read-deny; external anchor key. |
+| **M4: Multi-Domain Verifiers** | Code AST, test quality, CSV data schema, calculation checks, and citation matching. | **Foundational** | Syntactic checks implemented; deep semantic reasoning is roadmap. |
+| **M5: Reliability Benchmark Gate** | 7-case benchmark across known-good, known-bad, holdout, and adversarial suites. | **Completed** | Defect Recall 100%, Critical Recall 100%, FPR 0%, Gate PASSED. |
+
+---
+
 ## License
 
 Apache 2.0. Copyright © 2026 Amaura Labs.

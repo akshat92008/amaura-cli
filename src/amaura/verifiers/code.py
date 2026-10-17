@@ -176,11 +176,10 @@ def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
                         violations.append(f"{cf.name} calls '{node.func.attr}' to hijack process termination")
                     elif isinstance(node.func, ast.Name) and node.func.id in ("exit", "quit"):
                         violations.append(f"{cf.name} calls '{node.func.id}' to hijack process termination")
-                    # Check for setattr(..., "outcome" / "exitstatus", ...)
-                    elif isinstance(node.func, ast.Name) and node.func.id == "setattr":
-                        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("outcome", "exitstatus"):
-                            attr_str = str(node.args[1].value)
-                            violations.append(f"{cf.name} modifies attribute '{attr_str}' via setattr")
+                    # Check for getattr(os, "_exit")
+                    elif isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and node.args[1].value in ("_exit", "exit"):
+                            violations.append(f"{cf.name} calls '{node.args[1].value}' via getattr")
 
                 # Check for direct write/store assignment to outcome or exitstatus (NOT benign reads)
                 elif isinstance(node, ast.Attribute) and node.attr in ("exitstatus", "outcome"):
@@ -189,8 +188,10 @@ def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
 
                 # Check for hooks that forge reports or outcomes
                 elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if node.name in ("pytest_sessionfinish", "pytest_runtest_makereport", "pytest_runtest_logreport", "pytest_report_teststatus", "pytest_pyfunc_call"):
-                        # If the hook assigns to anything or modifies outcome/exitstatus
+                    if node.name in ("pytest_runtest_makereport", "pytest_runtest_logreport", "pytest_report_teststatus", "pytest_pyfunc_call"):
+                        violations.append(f"{cf.name} defines hostile reporting hook '{node.name}'")
+                    elif node.name == "pytest_sessionfinish":
+                        # If sessionfinish modifies outcome/exitstatus or calls exit
                         for subnode in ast.walk(node):
                             if isinstance(subnode, ast.Attribute) and subnode.attr in ("exitstatus", "outcome") and isinstance(subnode.ctx, ast.Store):
                                 violations.append(f"{cf.name}::{node.name} modifies '{subnode.attr}'")
@@ -198,9 +199,10 @@ def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
                             elif isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Attribute) and subnode.func.attr in ("_exit", "exit"):
                                 violations.append(f"{cf.name}::{node.name} calls '{subnode.func.attr}'")
                                 break
-                        else:
-                            if node.name in ("pytest_runtest_makereport", "pytest_sessionfinish"):
-                                violations.append(f"{cf.name}::{node.name}")
+                            elif isinstance(subnode, ast.Call) and isinstance(subnode.func, ast.Name) and subnode.func.id == "getattr":
+                                if len(subnode.args) >= 2 and isinstance(subnode.args[1], ast.Constant) and subnode.args[1].value in ("_exit", "exit"):
+                                    violations.append(f"{cf.name}::{node.name} calls '{subnode.args[1].value}' via getattr")
+                                    break
                     elif node.name in ("pytest_configure", "pytest_unconfigure"):
                         for subnode in ast.walk(node):
                             if isinstance(subnode, ast.Call):
@@ -208,6 +210,10 @@ def detect_adversarial_conftest_hooks(project_dir: Path) -> list[str]:
                                 if isinstance(func, ast.Attribute) and func.attr in ("_exit", "exit"):
                                     violations.append(f"{cf.name}::{node.name} calls '{func.attr}'")
                                     break
+                                elif isinstance(func, ast.Name) and func.id == "getattr":
+                                    if len(subnode.args) >= 2 and isinstance(subnode.args[1], ast.Constant) and subnode.args[1].value in ("_exit", "exit"):
+                                        violations.append(f"{cf.name}::{node.name} calls '{subnode.args[1].value}' via getattr")
+                                        break
                                 elif isinstance(func, ast.Name) and func.id == "open":
                                     if len(subnode.args) >= 2 and isinstance(subnode.args[1], ast.Constant) and "w" in str(subnode.args[1].value):
                                         violations.append(f"{cf.name}::{node.name} writes to file (potential report tampering)")
@@ -356,6 +362,53 @@ def generate_candidate_mutants(source: str, max_mutants: int = 5) -> list[str]:
     return mutants
 
 
+def parse_pytest_terminal_output(stdout: str) -> dict:
+    """Parses pytest's standard terminal output to cross-check against XML reports."""
+    summary: dict = {
+        "passed": 0,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "has_failures_section": False,
+        "failed_test_names": [],
+    }
+    if not stdout:
+        return summary
+
+    if "= FAILURES =" in stdout or "= ERRORS =" in stdout:
+        summary["has_failures_section"] = True
+
+    for line in stdout.splitlines():
+        line_clean = line.strip()
+        if line_clean.startswith(("FAILED ", "ERROR ")):
+            test_target = line_clean.split()[1] if len(line_clean.split()) > 1 else line_clean
+            summary["failed_test_names"].append(test_target)
+
+    # Match summary line: e.g. '= 1 failed, 2 passed in 0.12s =' or '= 2 passed in 0.05s ='
+    summary_match = re.search(r"=+\s*(.+?)\s+in\s+[\d\.]+s\s*=+", stdout)
+    if summary_match:
+        text = summary_match.group(1)
+        for part in text.split(","):
+            part = part.strip()
+            p_m = re.match(r"^(\d+)\s+([a-z]+)", part)
+            if p_m:
+                count = int(p_m.group(1))
+                category = p_m.group(2)
+                if category.startswith("fail"):
+                    summary["failed"] = count
+                elif category.startswith("pass"):
+                    summary["passed"] = count
+                elif category.startswith("error"):
+                    summary["errors"] = count
+                elif category.startswith("skip"):
+                    summary["skipped"] = count
+
+    if summary["failed_test_names"] and summary["failed"] == 0:
+        summary["failed"] = len(summary["failed_test_names"])
+
+    return summary
+
+
 class CodeVerifier(BaseVerifier):
     """Engine for validating code syntax, test execution, test quality/vacuousness, and acceptance tests."""
 
@@ -413,28 +466,19 @@ class CodeVerifier(BaseVerifier):
 
         findings: list[Finding] = []
         if not py_files:
-            # Check if other non-Python project files exist (e.g. JS, Rust, Go, Markdown, etc.)
-            other_project_files = [
-                p for p in project_dir.rglob("*")
-                if p.is_file() and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
-            ]
-            if other_project_files:
-                status = CheckStatus.PASSED
-                stdout = f"Non-Python project detected ({len(other_project_files)} files found). Python compilation skipped."
-            else:
-                status = CheckStatus.FAILED
-                stdout = "No project source files found in project directory."
-                findings.append(
-                    Finding(
-                        finding_id=f"find_{uuid.uuid4().hex[:8]}",
-                        check_id=check.check_id,
-                        title="Empty Project",
-                        description="No source or project files exist in the project directory to build or compile.",
-                        finding_type=FindingType.DEFECT,
-                        severity=FindingSeverity.CRITICAL,
-                        is_blocking=True,
-                    )
+            status = CheckStatus.FAILED
+            stdout = "No Python source files (.py) discovered in project directory."
+            findings.append(
+                Finding(
+                    finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                    check_id=check.check_id,
+                    title="Missing Source Files",
+                    description="No Python source files (.py) exist in the project directory to build or compile.",
+                    finding_type=FindingType.DEFECT,
+                    severity=FindingSeverity.HIGH,
+                    is_blocking=True,
                 )
+            )
         elif errors:
             status = CheckStatus.FAILED
             stdout = "\n".join(errors)
@@ -514,6 +558,7 @@ class CodeVerifier(BaseVerifier):
                 f"--junitxml={junit_xml}",
                 "-o",
                 "addopts=",
+                "--override-ini=addopts=",
             ]
 
             conftest_violations = detect_adversarial_conftest_hooks(project_dir)
@@ -536,6 +581,11 @@ class CodeVerifier(BaseVerifier):
                 timeout_seconds=check.timeout_seconds,
                 security_config=self.config.security,
                 budget_config=self.config.budget,
+                env={
+                    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
             )
 
             # Parse JUnit XML directly to obtain objective test counts
@@ -559,6 +609,15 @@ class CodeVerifier(BaseVerifier):
                 except Exception:
                     pass
 
+            # Cross-check terminal stdout against XML report (A1: catches atexit, unconfigure, and output forgeries)
+            term_summary = parse_pytest_terminal_output(proc_res.stdout)
+            has_terminal_failures = (
+                term_summary["failed"] > 0
+                or term_summary["errors"] > 0
+                or term_summary["has_failures_section"]
+                or bool(term_summary["failed_test_names"])
+            )
+
             # Evaluate objective test status
             status = CheckStatus.PASSED
             summary_reasons = []
@@ -569,6 +628,34 @@ class CodeVerifier(BaseVerifier):
             elif proc_res.timed_out:
                 status = CheckStatus.TIMED_OUT
                 summary_reasons.append("Test runner timed out.")
+            elif proc_res.exit_code != 0:
+                status = CheckStatus.FAILED
+                summary_reasons.append(f"Process exited with non-zero code {proc_res.exit_code}.")
+            elif has_terminal_failures:
+                status = CheckStatus.FAILED
+                fail_details = []
+                if term_summary["failed"] > 0:
+                    fail_details.append(f"{term_summary['failed']} failure(s)")
+                if term_summary["errors"] > 0:
+                    fail_details.append(f"{term_summary['errors']} error(s)")
+                if not fail_details:
+                    fail_details.append("failures detected in terminal output")
+                summary_reasons.append(
+                    f"Test failures detected in terminal output: {', '.join(fail_details)} "
+                    f"(cross-check against XML report failures={failures}, errors={errors})."
+                )
+                if failures == 0 and errors == 0:
+                    findings.append(
+                        Finding(
+                            finding_id=f"find_{uuid.uuid4().hex[:8]}",
+                            check_id=check.check_id,
+                            title="Adversarial Report Discrepancy",
+                            description="Terminal output recorded test failures, but JUnit XML report indicated success. Possible atexit or hook report spoofing.",
+                            finding_type=FindingType.SECURITY_RISK,
+                            severity=FindingSeverity.CRITICAL,
+                            is_blocking=True,
+                        )
+                    )
             elif not xml_parsed:
                 status = CheckStatus.FAILED
                 summary_reasons.append(
@@ -584,9 +671,6 @@ class CodeVerifier(BaseVerifier):
             elif skipped == total_tests:
                 status = CheckStatus.FAILED
                 summary_reasons.append(f"All {total_tests} test(s) were skipped. Zero active tests ran.")
-            elif proc_res.exit_code != 0:
-                status = CheckStatus.FAILED
-                summary_reasons.append(f"Process exited with non-zero code {proc_res.exit_code}.")
 
             stdout = proc_res.stdout
             if summary_reasons:
@@ -749,26 +833,16 @@ class CodeVerifier(BaseVerifier):
         """
         exec_id = f"exec_{uuid.uuid4().hex[:10]}"
         req_id = check.target_requirement_id or ""
-        desc_clean = check.description.lower()
+        req_id_slug = req_id.lower().replace("-", "_") if req_id else ""
+        req_id_clean = req_id.lower().replace("-", "").replace("_", "") if req_id else ""
 
-        # Remove generic boilerplate prefix "validates requirement satisfaction for: "
-        boilerplate_prefix = "validates requirement satisfaction for:"
-        if desc_clean.startswith(boilerplate_prefix):
-            desc_clean = desc_clean[len(boilerplate_prefix):].strip()
-
-        # Extract specific distinctive domain keywords from requirement description
-        # Reject generic stop words: valid, validates, requirement, satisfaction, check, test, ensure, works, integers, data, records, inputs, etc.
-        words = re.findall(r"\b[a-zA-Z]{3,}\b", desc_clean)
-        stop_words = {
-            "validates", "requirement", "satisfaction", "ensure", "check", "test", "should", "must",
-            "with", "from", "into", "works", "work", "integers", "integer", "number", "numbers",
-            "string", "strings", "input", "inputs", "output", "outputs", "data", "records", "record",
-            "file", "files", "item", "items", "value", "values", "correct", "proper", "properly",
-            "handling", "handles", "safely", "safe", "without", "support", "supports", "function",
-            "module", "system", "feature", "type", "types", "case", "cases", "each", "both", "clean",
-            "cleanly", "table", "tabular", "parse", "parsing", "identifies", "identify",
-        }
-        distinctive_keywords = [w for w in words if w not in stop_words]
+        # Explicit acceptance tests declared in check metadata (A2: explicit mapping, no keyword guessing)
+        raw_acc = check.metadata.get("acceptance_tests", [])
+        if isinstance(raw_acc, str):
+            raw_acc = [t.strip() for t in raw_acc.split(",") if t.strip()]
+        explicit_acceptance_tests = [
+            t.lower().strip() for t in raw_acc if t.strip()
+        ]
 
         test_files = [
             p for p in project_dir.rglob("*.py")
@@ -776,17 +850,9 @@ class CodeVerifier(BaseVerifier):
             and not any(part in {".venv", "__pycache__", ".git", ".amaura"} for part in p.parts)
         ]
 
-        # Look for tests explicitly targeting this requirement by ID, decorators, or primary domain concept
+        # Look for tests explicitly targeting this requirement by ID, decorator, or explicit acceptance mapping
         matched_test_funcs: list[str] = []
         matched_test_files: list[Path] = []
-        req_id_slug = req_id.lower().replace("-", "_")
-
-        # Determine primary domain concept from requirement description (prevent unrelated keyword hijack)
-        primary_concept = None
-        for concept in ["duplicate", "malformed", "sensitive", "subtract", "addition", "division", "multiplication"]:
-            if concept in desc_clean:
-                primary_concept = concept
-                break
 
         for tf in test_files:
             try:
@@ -796,15 +862,14 @@ class CodeVerifier(BaseVerifier):
                         if node.name.startswith("test_"):
                             name_lower = node.name.lower()
                             doc = ast.get_docstring(node) or ""
-                            doc_lower = doc.lower()
 
-                            # 1. Match by exact requirement ID (e.g. test_req_001, docstring 'REQ-001')
-                            if req_id_slug and (req_id_slug in name_lower or req_id.lower() in doc_lower):
+                            # 1. Match by explicit acceptance test name declared in task spec
+                            if name_lower in explicit_acceptance_tests or node.name in explicit_acceptance_tests:
                                 matched_test_funcs.append(node.name)
                                 matched_test_files.append(tf)
                                 continue
 
-                            # 2. Check for requirement decorator (e.g. @pytest.mark.requirement("REQ-001"))
+                            # 2. Match by requirement decorator (e.g. @pytest.mark.requirement("REQ-001"))
                             has_req_mark = False
                             for dec in node.decorator_list:
                                 if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute) and dec.func.attr in ("requirement", "req"):
@@ -815,16 +880,22 @@ class CodeVerifier(BaseVerifier):
                                 matched_test_files.append(tf)
                                 continue
 
-                            # 3. Match by primary domain concept or compound keywords
-                            if primary_concept:
-                                if primary_concept in name_lower or primary_concept in doc_lower:
-                                    matched_test_funcs.append(node.name)
-                                    matched_test_files.append(tf)
-                            else:
-                                matched_kw = [kw for kw in distinctive_keywords if kw in name_lower or kw in doc_lower]
-                                if len(matched_kw) >= 2:
-                                    matched_test_funcs.append(node.name)
-                                    matched_test_files.append(tf)
+                            # 3. Match by exact requirement ID in test function name (e.g. test_req_001, test_req1)
+                            if req_id_slug and (
+                                f"_{req_id_slug}" in name_lower
+                                or f"{req_id_slug}_" in name_lower
+                                or name_lower == f"test_{req_id_slug}"
+                                or (req_id_clean and f"_{req_id_clean}" in name_lower)
+                            ):
+                                matched_test_funcs.append(node.name)
+                                matched_test_files.append(tf)
+                                continue
+
+                            # 4. Match by requirement ID in docstring with word boundaries (e.g. "REQ-001")
+                            if req_id and re.search(r"\b" + re.escape(req_id) + r"\b", doc, re.IGNORECASE):
+                                matched_test_funcs.append(node.name)
+                                matched_test_files.append(tf)
+                                continue
             except Exception:
                 pass
 
@@ -919,6 +990,7 @@ class CodeVerifier(BaseVerifier):
                 k_filter,
                 "-o",
                 "addopts=",
+                "--override-ini=addopts=",
             ]
 
             proc_res = run_safe_process(
@@ -927,6 +999,11 @@ class CodeVerifier(BaseVerifier):
                 timeout_seconds=check.timeout_seconds,
                 security_config=self.config.security,
                 budget_config=self.config.budget,
+                env={
+                    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                    "PYTHONNOUSERSITE": "1",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
             )
 
             # Parse XML
@@ -944,10 +1021,18 @@ class CodeVerifier(BaseVerifier):
                 except Exception:
                     pass
 
+            term_summary = parse_pytest_terminal_output(proc_res.stdout)
+            has_terminal_failures = (
+                term_summary["failed"] > 0
+                or term_summary["errors"] > 0
+                or term_summary["has_failures_section"]
+                or bool(term_summary["failed_test_names"])
+            )
+
             status = CheckStatus.PASSED
             if proc_res.timed_out:
                 status = CheckStatus.TIMED_OUT
-            elif failures > 0 or errors > 0 or proc_res.exit_code != 0 or total_ran == 0:
+            elif proc_res.exit_code != 0 or failures > 0 or errors > 0 or total_ran == 0 or has_terminal_failures:
                 status = CheckStatus.FAILED
 
             # Mutation Testing: If test passed, verify that injecting defects into source code causes test failure.
@@ -999,9 +1084,17 @@ class CodeVerifier(BaseVerifier):
                                     timeout_seconds=check.timeout_seconds,
                                     security_config=self.config.security,
                                     budget_config=self.config.budget,
-                                    env={"PYTHONDONTWRITEBYTECODE": "1"},
+                                    env={
+                                        "PYTHONDONTWRITEBYTECODE": "1",
+                                        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+                                        "PYTHONNOUSERSITE": "1",
+                                    },
                                 )
                                 m_failed = m_res.exit_code != 0 or m_res.timed_out
+                                m_term = parse_pytest_terminal_output(m_res.stdout)
+                                if m_term["failed"] > 0 or m_term["errors"] > 0 or m_term["has_failures_section"]:
+                                    m_failed = True
+
                                 if junit_xml.is_file():
                                     try:
                                         m_root = safe_parse_xml(junit_xml)

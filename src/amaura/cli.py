@@ -814,10 +814,13 @@ def benchmark(
     if metrics.adversarial_cases > 0:
         table.add_row("Adversarial Evasion Detection", f"{metrics.adversarial_detection_rate * 100:.1f}%", "100.0%")
 
-    # Extended reliability metrics (G6)
-    table.add_row("Claim-Support Precision", f"{metrics.claim_support_precision * 100:.1f}%", "100.0%")
-    table.add_row("Repair Success Rate", f"{metrics.repair_success_rate * 100:.1f}%", "100.0%")
-    table.add_row("Reproducibility Rate", f"{metrics.reproducibility_rate * 100:.1f}%", "100.0%")
+    # Extended reliability metrics (G6: unmeasured fields displayed transparently)
+    claim_prec_str = f"{metrics.claim_support_precision * 100:.1f}%" if metrics.claim_support_precision is not None else "[dim]N/A[/dim]"
+    table.add_row("Claim-Support Precision", claim_prec_str, "100.0%")
+    repair_str = f"{metrics.repair_success_rate * 100:.1f}%" if metrics.repair_success_rate is not None else "[dim]N/A (unmeasured - repair roadmap)[/dim]"
+    table.add_row("Repair Success Rate", repair_str, "Roadmap")
+    repro_str = f"{metrics.reproducibility_rate * 100:.1f}%" if metrics.reproducibility_rate is not None else "[dim]N/A[/dim]"
+    table.add_row("Reproducibility Rate", repro_str, "100.0%")
     table.add_row("Total Verification Cost (USD)", f"${metrics.total_cost_usd:.4f}", "$0.0000")
     table.add_row("Secret/Env Leakage Detected", str(metrics.leakage_detected), "0")
 

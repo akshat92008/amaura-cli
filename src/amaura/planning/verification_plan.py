@@ -82,6 +82,9 @@ class VerificationPlan:
                     timeout_seconds=30,
                     target_requirement_id=req.id,
                     target_claim_id=f"CLM-{req.id}",
+                    metadata={
+                        "acceptance_tests": req.acceptance_criteria,
+                    },
                 )
             )
 

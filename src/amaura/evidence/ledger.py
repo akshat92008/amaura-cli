@@ -18,9 +18,10 @@ from amaura.models.run import RunRecord
 class EvidenceLedger:
     """Manages immutable persistence of verification run artifacts and append-only evidence ledgers."""
 
-    def __init__(self, runs_dir: Path):
+    def __init__(self, runs_dir: Path, anchor_key_path: Optional[Path] = None):
         self.runs_dir = runs_dir.resolve()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self._custom_anchor_key_path = anchor_key_path
 
     def validate_run_id(self, run_id: str) -> str:
         """Sanitizes and validates run_id to prevent path traversal outside runs_dir."""
@@ -51,20 +52,48 @@ class EvidenceLedger:
 
     @property
     def anchor_key_file(self) -> Path:
-        return self.runs_dir / ".anchor_key"
+        if self._custom_anchor_key_path:
+            return self._custom_anchor_key_path.resolve()
+        # Secure location outside workspace/ledger directory (B1, B4)
+        home_key_dir = Path.home() / ".amaura"
+        try:
+            home_key_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(home_key_dir, 0o700)
+            except OSError:
+                pass
+            return home_key_dir / "ledger_anchor.key"
+        except (OSError, PermissionError):
+            return self.runs_dir / ".anchor_key"
 
     def _get_or_create_anchor_key(self) -> bytes:
         """Retrieves or initializes the cryptographic HMAC secret key for the ledger anchor."""
-        if self.anchor_key_file.is_file():
-            return self.anchor_key_file.read_bytes()
+        env_key = os.environ.get("AMAURA_LEDGER_KEY") or os.environ.get("AMAURA_ANCHOR_KEY")
+        if env_key:
+            return env_key.encode("utf-8")
+
+        key_file = self.anchor_key_file
+        if key_file.is_file():
+            return key_file.read_bytes()
         key = secrets.token_bytes(32)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         try:
-            fd = os.open(self.anchor_key_file, flags, 0o600)
+            fd = os.open(key_file, flags, 0o600)
             with os.fdopen(fd, "wb") as f:
                 f.write(key)
-        except FileExistsError:
-            return self.anchor_key_file.read_bytes()
+        except (FileExistsError, OSError):
+            if key_file.is_file():
+                return key_file.read_bytes()
+            fallback_file = self.runs_dir / ".anchor_key"
+            if fallback_file.is_file():
+                return fallback_file.read_bytes()
+            try:
+                fd = os.open(fallback_file, flags, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(key)
+            except Exception:
+                pass
+            return key
         return key
 
     def _update_anchor(self, chain_length: int, head_block_hash: str, last_run_id: str) -> None:

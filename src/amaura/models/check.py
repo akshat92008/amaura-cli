@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +41,7 @@ class CheckDefinition(BaseModel):
     timeout_seconds: int = 30
     target_requirement_id: str | None = None
     target_claim_id: str | None = None
-    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class CheckExecution(BaseModel):

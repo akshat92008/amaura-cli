@@ -380,7 +380,7 @@ def test_probe_placeholder_test_caught_by_mutation_testing(tmp_path: Path):
     )
     task_file = tmp_path / "task.md"
     task_file.write_text(
-        "# Task: Math\n## Requirements\n- REQ-001: Subtract numbers correctly\n"
+        "# Task: Math\n## Requirements\n- REQ-001: Subtract numbers correctly (acceptance: test_subtract)\n"
     )
 
     record = verify_project(project_dir=tmp_path, task_file=task_file)

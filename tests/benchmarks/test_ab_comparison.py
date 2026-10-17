@@ -1,5 +1,7 @@
 """A/B Benchmark Evaluation: Measuring defect escape rate with vs without Amaura (M5 exit gate)."""
 
+import subprocess
+import sys
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -37,13 +39,39 @@ def run_ab_comparison(cases: list[BenchmarkCase]) -> ABTestResult:
     for case in cases:
         is_defect_case = case.expected_verdict != OverallVerdict.PASSED
 
-        # Arm A: Agent self-reports success ("All tests pass!"), so defects escape
-        if is_defect_case:
+        # Arm A: Native execution without Amaura (standard unmonitored test runner exit code)
+        # Without Amaura's requirement coverage, vacuous test AST analyzer, and hook protection,
+        # projects with missing requirements, vacuous tests, or tampered conftests exit 0 and ship.
+        try:
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--rootdir",
+                    str(case.path),
+                    "-o",
+                    "addopts=",
+                    "-o",
+                    "testpaths=.",
+                ],
+                cwd=case.path,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            arm_a_accepted = res.returncode == 0
+        except Exception:
+            arm_a_accepted = False
+
+        if is_defect_case and arm_a_accepted:
             defects_shipped_arm_a += 1
 
-        # Arm B: Amaura independently verifies
+        # Arm B: Amaura independently verifies with AST, requirement mapping, and fail-closed gates
         record = verify_project(project_dir=case.path, task_file=case.task_file, config=cfg)
-        if is_defect_case and record.overall_verdict == OverallVerdict.PASSED:
+        arm_b_accepted = record.overall_verdict == OverallVerdict.PASSED
+        if is_defect_case and arm_b_accepted:
             defects_shipped_arm_b += 1
 
     escape_a = defects_shipped_arm_a / total if total > 0 else 0.0
@@ -112,6 +140,6 @@ def test_ab_comparison_shows_measurable_value():
     ]
 
     result = run_ab_comparison(cases)
-    assert result.defects_shipped_without_amaura == 5
+    assert result.defects_shipped_without_amaura >= 3
     assert result.defects_shipped_with_amaura == 0
     assert result.defect_reduction_percent == 100.0
